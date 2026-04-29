@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+*.pyd
+*.joblib
+data/raw/*.csv
+data/processed/*.csv
