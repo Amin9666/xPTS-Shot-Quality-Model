@@ -9,3 +9,4 @@ __pycache__/
 *.joblib
 data/raw/*.csv
 data/processed/*.csv
+anaconda_projects
