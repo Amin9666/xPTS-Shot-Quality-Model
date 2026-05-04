@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from src.generate_synthetic_data import generate_shots
+from src.data_loader import fetch_player_shot_chart
 from src.features import build_model_frame
 from src.model import (
     train_model,
@@ -53,10 +53,19 @@ sns.set_theme(style="darkgrid", palette="muted")
 # 1. Data
 # ---------------------------------------------------------------------------
 print("=" * 60)
-print("Step 1 – Generating synthetic shot data …")
+print("Step 1 – Fetching real shot chart data: Stephen Curry (2023-24) …")
 raw_path = Path("data/raw/shots.csv")
 raw_path.parent.mkdir(parents=True, exist_ok=True)
-shots_raw = generate_shots(12_000)
+
+using_real_data = True
+try:
+    shots_raw = fetch_player_shot_chart(player_id=201939, season="2023-24")
+except Exception as _fetch_err:
+    print(f"  WARNING: nba_api fetch failed, falling back to synthetic data.", file=sys.stderr)
+    from src.generate_synthetic_data import generate_shots
+    shots_raw = generate_shots(12_000)
+    using_real_data = False
+
 shots_raw.to_csv(raw_path, index=False)
 print(f"  {len(shots_raw):,} shots saved → {raw_path}")
 
@@ -130,6 +139,12 @@ shots.to_csv(processed_path, index=False)
 # ---------------------------------------------------------------------------
 print("\nStep 6 – Generating charts …")
 
+chart_title = (
+    "Stephen Curry (2023-24) – Shot Chart Coloured by xPTS"
+    if using_real_data
+    else "Shot Chart – Coloured by xPTS"
+)
+
 
 # ── 6a. NBA half-court shot chart coloured by xPTS ─────────────────────────
 def draw_half_court(ax: plt.Axes, color: str = "#aaaaaa") -> None:
@@ -162,7 +177,7 @@ plt.colorbar(sc, ax=ax, label="Expected Points (xPTS)", fraction=0.03, pad=0.02)
 ax.set_xlim(-260, 260)
 ax.set_ylim(-60, 500)
 ax.set_aspect("equal")
-ax.set_title("Shot Chart – Coloured by xPTS", color="white", fontsize=15, pad=12)
+ax.set_title(chart_title, color="white", fontsize=15, pad=12)
 ax.tick_params(colors="white")
 for spine in ax.spines.values():
     spine.set_edgecolor("#555577")

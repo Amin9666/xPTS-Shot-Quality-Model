@@ -19,7 +19,7 @@ NBA teams and analysts need a better way to evaluate shot selection than field g
 
 All suggested sources are free to access.
 
-- `nba_api`: official NBA stats endpoints for shot charts, play-by-play, and game logs.
+- `nba_api`: official NBA stats endpoints for shot charts, play-by-play, and game logs. Real player shot charts are now fetched by default — the pipeline pulls **Stephen Curry's 2023-24 regular-season shot chart** at runtime. If the API is unavailable, the pipeline automatically falls back to synthetic data.
 - Basketball-Reference: useful for player and team tables via `pandas.read_html` or `BeautifulSoup`.
 - `pbpstats.com`: advanced play-by-play context for possessions and game state.
 - Kaggle NBA datasets: fast starting point for pre-cleaned CSVs and historical shot logs.
@@ -145,7 +145,7 @@ streamlit run app/app.py
 
 ## Next Build Targets
 
-- Connect `src/data_loader.py` to real `nba_api` endpoints.
+- ~~Connect `src/data_loader.py` to real `nba_api` endpoints.~~ ✅ Done — `fetch_player_shot_chart` now pulls Stephen Curry's 2023-24 shot chart by default.
 - Save a processed modeling dataset to `data/processed/shots.csv`.
 - Train and serialize a baseline model artifact.
 - Replace placeholder charts in the Streamlit app with modeled outputs.
