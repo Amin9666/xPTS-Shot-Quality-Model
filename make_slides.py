@@ -504,17 +504,16 @@ ax.set_facecolor(BG)
 fig.patch.set_facecolor(BG)
 
 steps = [
-    ("1. Synthetic\nData Generation", "#3498db"),
-    ("2. Feature\nEngineering", "#9b59b6"),
-    ("3. Leakage-Free\nCV (5-fold)", "#e67e22"),
-    ("4. Hyper-\nparameter Tuning", "#e74c3c"),
-    ("5. Model\nTraining", "#27ae60"),
-    ("6. Evaluation &\nCharts", "#1abc9c"),
+    ("1. Feature\nEngineering", "#9b59b6"),
+    ("2. Leakage-Free\nCV (5-fold)", "#e67e22"),
+    ("3. Hyper-\nparameter Tuning", "#e74c3c"),
+    ("4. Model\nTraining", "#27ae60"),
+    ("5. Evaluation &\nCharts", "#1abc9c"),
 ]
 
 box_w, box_h = 0.13, 0.50
-gap = 0.155
-start_x = 0.02
+gap = 0.185
+start_x = 0.06
 
 for i, (label, color) in enumerate(steps):
     x = start_x + i * gap
