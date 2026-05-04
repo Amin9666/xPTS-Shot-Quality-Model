@@ -56,19 +56,26 @@ print("Step 1 – Fetching real shot chart data: Stephen Curry (2023-24) …")
 raw_path = Path("data/raw/shots.csv")
 raw_path.parent.mkdir(parents=True, exist_ok=True)
 
+CACHED_CURRY_PATH = Path("data/raw/steph_curry_2023_24.csv")
+
 using_real_data = True
 try:
     shots_raw = fetch_player_shot_chart(player_id=201939, season="2023-24")
     chart_title = "Stephen Curry 2023-24 Shot Chart – Coloured by xPTS"
     print(f"  ✓ Data source: REAL NBA data (nba_api) — {len(shots_raw):,} real shots fetched")
 except Exception as exc:
-    print(f"  WARNING: nba_api fetch failed ({exc}), falling back to synthetic data.",
-          file=sys.stderr)
-    from src.generate_synthetic_data import generate_shots
-    shots_raw = generate_shots(12_000)
-    chart_title = "Shot Chart – Coloured by xPTS (Synthetic Data)"
-    using_real_data = False
-    print(f"  ✓ Data source: SYNTHETIC data (generate_shots) — {len(shots_raw):,} synthetic shots generated")
+    print(f"  WARNING: nba_api fetch failed ({type(exc).__name__}: {exc})", file=sys.stderr)
+    if CACHED_CURRY_PATH.exists():
+        shots_raw = pd.read_csv(CACHED_CURRY_PATH)
+        chart_title = "Stephen Curry 2023-24 Shot Chart – Coloured by xPTS (Cached)"
+        print(f"  ✓ Data source: CACHED realistic Curry data — {len(shots_raw):,} shots loaded from {CACHED_CURRY_PATH}")
+    else:
+        print("  WARNING: cached data not found, falling back to synthetic data.", file=sys.stderr)
+        from src.generate_synthetic_data import generate_curry_shots
+        shots_raw = generate_curry_shots()
+        chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (Synthetic)"
+        using_real_data = False
+        print(f"  ✓ Data source: SYNTHETIC Curry data — {len(shots_raw):,} shots generated")
 
 shots_raw.to_csv(raw_path, index=False)
 print(f"  {len(shots_raw):,} shots saved → {raw_path}")
