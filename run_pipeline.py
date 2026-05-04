@@ -85,7 +85,7 @@ def _raise_if_ci() -> None:
     Raising here lets the surrounding ``except`` block fall through to the
     synthetic-data fallback immediately.
     """
-    if os.getenv("CI"):
+    if os.getenv("CI") == "true":
         raise EnvironmentError(
             "Running in CI/cloud environment — skipping nba_api fetch "
             "(stats.nba.com blocks datacenter IPs). Using synthetic data fallback."
