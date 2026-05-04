@@ -17,6 +17,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -73,6 +74,22 @@ def _looks_like_real_data(df: pd.DataFrame) -> bool:
         return True
     real_cols = {"game_id", "player_id"}
     return bool(real_cols.intersection(df.columns))
+
+
+def _raise_if_ci() -> None:
+    """Raise EnvironmentError when running inside a CI/cloud environment.
+
+    GitHub Actions and Codespaces both set the ``CI`` environment variable to
+    ``"true"``.  ``stats.nba.com`` blocks requests from datacenter IP ranges,
+    so attempting the nba_api fetch in those environments always times out.
+    Raising here lets the surrounding ``except`` block fall through to the
+    synthetic-data fallback immediately.
+    """
+    if os.getenv("CI") == "true":
+        raise EnvironmentError(
+            "Running in CI/cloud environment — skipping nba_api fetch "
+            "(stats.nba.com blocks datacenter IPs). Using synthetic data fallback."
+        )
 
 
 def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
@@ -174,6 +191,7 @@ if raw_path.exists():
 
         # ── Priority 2: fetch full league via nba_api ─────────────────────────
         try:
+            _raise_if_ci()
             print("  Fetching full 2023-24 league shot data via nba_api (all 30 teams) …")
             shots_raw = _fetch_full_league(season="2023-24")
             shots_raw = _normalise_league_csv(shots_raw)
@@ -197,6 +215,7 @@ if raw_path.exists():
 else:
     # ── Priority 2: fetch full league via nba_api ─────────────────────────────
     try:
+        _raise_if_ci()
         print("  data/raw/shots.csv not found. Fetching full 2023-24 league data via nba_api …")
         shots_raw = _fetch_full_league(season="2023-24")
         shots_raw = _normalise_league_csv(shots_raw)
