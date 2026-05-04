@@ -159,7 +159,9 @@ sc = ax.scatter(
     s=12, alpha=0.7, vmin=0.4, vmax=1.6, linewidths=0,
 )
 plt.colorbar(sc, ax=ax, label="Expected Points (xPTS)", fraction=0.03, pad=0.02)
-ax.set_xlim(-260, 260); ax.set_ylim(-60, 500); ax.set_aspect("equal")
+ax.set_xlim(-260, 260)
+ax.set_ylim(-60, 500)
+ax.set_aspect("equal")
 ax.set_title("Shot Chart – Coloured by xPTS", color="white", fontsize=15, pad=12)
 ax.tick_params(colors="white")
 for spine in ax.spines.values():

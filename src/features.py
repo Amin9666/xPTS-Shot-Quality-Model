@@ -22,10 +22,11 @@ def add_polynomial_features(dataframe: pd.DataFrame) -> pd.DataFrame:
         squared term helps linear learners (logistic regression) model this
         without feature crosses.
 
-    ``log_distance``
-        Log-scale distance emphasises the near-basket regime where small
+    ``log1p_distance``
+        log(1 + distance) emphasises the near-basket regime where small
         changes in range have a large effect on make-probability (the curve
-        is steep inside ~10 ft and flattens beyond the arc).
+        is steep inside ~10 ft and flattens beyond the arc).  The +1 offset
+        ensures continuity at zero distance.
 
     ``dist_angle_ix``
         Distance × |angle| interaction. Shots from the same distance are
@@ -36,7 +37,7 @@ def add_polynomial_features(dataframe: pd.DataFrame) -> pd.DataFrame:
     frame = dataframe.copy()
     if "shot_distance" in frame.columns:
         frame["distance_sq"] = frame["shot_distance"] ** 2
-        frame["log_distance"] = np.log1p(frame["shot_distance"])
+        frame["log1p_distance"] = np.log1p(frame["shot_distance"])
     if {"shot_distance", "shot_angle"}.issubset(frame.columns):
         frame["dist_angle_ix"] = frame["shot_distance"] * frame["shot_angle"].abs()
     return frame

@@ -35,7 +35,7 @@ FEATURE_COLUMNS = [
     "shot_distance",
     "shot_angle",
     "distance_sq",
-    "log_distance",
+    "log1p_distance",
     "dist_angle_ix",
     "period",
     "game_seconds_remaining",
@@ -212,8 +212,13 @@ def expected_calibration_error(
     bins = np.linspace(0.0, 1.0, n_bins + 1)
     ece = 0.0
     n = len(y_true)
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        mask = (y_prob >= lo) & (y_prob < hi)
+    for b, (lo, hi) in enumerate(zip(bins[:-1], bins[1:])):
+        # Include the upper boundary in the last bin so that predictions
+        # equal to exactly 1.0 are not silently dropped.
+        if b < n_bins - 1:
+            mask = (y_prob >= lo) & (y_prob < hi)
+        else:
+            mask = (y_prob >= lo) & (y_prob <= hi)
         if not mask.any():
             continue
         acc = float(y_true[mask].mean())
