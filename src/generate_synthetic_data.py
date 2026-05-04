@@ -217,7 +217,8 @@ def generate_curry_shots(seed: int = 42) -> pd.DataFrame:
 
     for zone, count in _CURRY_ZONE_COUNTS.items():
         x, y = _sample_zone_coords(zone, count)
-        distance_ft = np.sqrt(x**2 + y**2) / 10.0
+        distance_ft = np.sqrt(x**2 + y**2) / 10.0  # NBA coords are in tenths of a foot
+        # Substitute EPSILON for x=0 to avoid atan2(y,0) singularity at the basket centre
         angle_deg = np.degrees(np.arctan2(y, np.where(x == 0, EPSILON, x)))
 
         period = rng.integers(1, 5, count)
@@ -225,6 +226,12 @@ def generate_curry_shots(seed: int = 42) -> pd.DataFrame:
         seconds_rem = rng.integers(0, 60, count)
         shot_clock = rng.uniform(0, 24, count)
         score_diff = rng.integers(-25, 26, count)
+
+        # Derive home/away scores so that home_score - away_score == score_diff,
+        # keeping both values in a realistic NBA range (≈ 80–130).
+        away_score_base = rng.integers(80, 106, count)
+        home_score = away_score_base + score_diff
+        away_score = away_score_base
 
         make_prob = _CURRY_ZONE_MAKE_PROB[zone]
         # Small contextual adjustments (late clock hurts, close game slight boost)
@@ -249,8 +256,8 @@ def generate_curry_shots(seed: int = 42) -> pd.DataFrame:
                     "minutes_remaining": int(minutes_rem[i]),
                     "seconds_remaining": int(seconds_rem[i]),
                     "shot_clock": round(float(shot_clock[i]), 1),
-                    "home_score": int(rng.integers(80, 120)),
-                    "away_score": int(rng.integers(80, 120)),
+                    "home_score": int(home_score[i]),
+                    "away_score": int(away_score[i]),
                     "shot_result": "Made Shot" if made[i] else "Missed Shot",
                     "shot_made_flag": int(made[i]),
                     "shot_type": f"{shot_value_scalar}PT Field Goal",
