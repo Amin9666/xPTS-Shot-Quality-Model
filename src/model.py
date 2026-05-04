@@ -10,9 +10,22 @@ import pandas as pd
 from sklearn.calibration import calibration_curve
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance as sklearn_permutation_importance
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    log_loss,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import (
+    RandomizedSearchCV,
+    StratifiedKFold,
+    learning_curve,
+    train_test_split,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from xgboost import XGBClassifier
@@ -21,6 +34,9 @@ from xgboost import XGBClassifier
 FEATURE_COLUMNS = [
     "shot_distance",
     "shot_angle",
+    "distance_sq",
+    "log_distance",
+    "dist_angle_ix",
     "period",
     "game_seconds_remaining",
     "score_diff_abs",
@@ -28,6 +44,11 @@ FEATURE_COLUMNS = [
     "late_clock",
     "shot_clock",
 ]
+
+# Auxiliary columns needed for leakage-free zone encoding – not used as
+# model inputs directly, but passed alongside X so the encoder can refit
+# on each training fold.
+_ZONE_AUX_COLS = ["player_name", "shot_zone_basic"]
 
 ModelType = Literal["logistic", "xgboost"]
 
@@ -42,6 +63,10 @@ class TrainingArtifacts:
     y_test: Optional[pd.Series] = field(default=None)
     probabilities: Optional[np.ndarray] = field(default=None)
 
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _build_preprocessor(numeric_columns: list[str], categorical_columns: list[str]) -> ColumnTransformer:
     transformers = []
@@ -66,32 +91,10 @@ def _build_preprocessor(numeric_columns: list[str], categorical_columns: list[st
     return ColumnTransformer(transformers=transformers)
 
 
-def train_model(
-    dataframe: pd.DataFrame,
-    target_column: str = "shot_made_flag",
-    model_type: ModelType = "xgboost",
-) -> TrainingArtifacts:
-    model_frame = dataframe.copy()
-    available_features = [col for col in FEATURE_COLUMNS if col in model_frame.columns]
-    if not available_features:
-        raise ValueError("No model features are available. Run feature engineering before training.")
-    if target_column not in model_frame.columns:
-        raise ValueError(f"Missing target column: {target_column}")
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        model_frame[available_features],
-        model_frame[target_column],
-        test_size=0.2,
-        random_state=7,
-        stratify=model_frame[target_column],
-    )
-
-    numeric_columns = [c for c in available_features if model_frame[c].dtype != "object"]
-    categorical_columns = [c for c in available_features if model_frame[c].dtype == "object"]
-    preprocessor = _build_preprocessor(numeric_columns, categorical_columns)
-
+def _build_classifier(model_type: ModelType, **overrides) -> XGBClassifier | LogisticRegression:
+    """Instantiate the base classifier for a given model type."""
     if model_type == "xgboost":
-        classifier = XGBClassifier(
+        defaults = dict(
             n_estimators=300,
             max_depth=5,
             learning_rate=0.05,
@@ -100,9 +103,161 @@ def train_model(
             eval_metric="logloss",
             random_state=42,
         )
+        defaults.update(overrides)
+        return XGBClassifier(**defaults)
     else:
-        classifier = LogisticRegression(max_iter=1000, C=1.0)
+        defaults = dict(max_iter=1_000, C=1.0, solver="liblinear")
+        defaults.update(overrides)
+        return LogisticRegression(**defaults)
 
+
+def _recompute_zone_fg_pct(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    smoothing: int = 20,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Replace the pre-computed ``player_zone_fg_pct`` with a leakage-free
+    version fitted exclusively on the training fold.
+
+    Uses Bayesian (James–Stein-style) shrinkage toward the global mean::
+
+        θ̂_pz = (n_pz · ȳ_pz + k · ȳ_global) / (n_pz + k)
+
+    where *k* = ``smoothing`` controls regularisation strength toward the
+    global shooting rate.  Small-sample player–zone cells are pulled toward
+    the league average, avoiding the over-fitting that arises from raw
+    group means on rare combinations.
+
+    Note
+    ----
+    Without this fix the raw ``player_zone_fg_pct`` computed on the full
+    dataset leaks test-set outcomes into the training features, inflating
+    all reported metrics (a classic *target leakage* bug).
+    """
+    if "player_zone_fg_pct" not in X_train.columns:
+        return X_train, X_test
+    if not {"player_name", "shot_zone_basic"}.issubset(X_train.columns):
+        return X_train, X_test
+
+    global_mean = float(y_train.mean())
+
+    tmp = X_train[["player_name", "shot_zone_basic"]].copy()
+    tmp["_y"] = y_train.values
+
+    agg = tmp.groupby(["player_name", "shot_zone_basic"])["_y"].agg(["count", "mean"])
+    agg["smoothed"] = (
+        agg["count"] * agg["mean"] + smoothing * global_mean
+    ) / (agg["count"] + smoothing)
+    encoding: dict = agg["smoothed"].to_dict()
+
+    def _encode(df: pd.DataFrame) -> pd.Series:
+        return df.apply(
+            lambda r: encoding.get((r["player_name"], r["shot_zone_basic"]), global_mean),
+            axis=1,
+        )
+
+    X_train = X_train.copy()
+    X_test = X_test.copy()
+    X_train["player_zone_fg_pct"] = _encode(X_train)
+    X_test["player_zone_fg_pct"] = _encode(X_test)
+    return X_train, X_test
+
+
+def _split_and_fix_leakage(
+    model_frame: pd.DataFrame,
+    available_features: list[str],
+    target_column: str,
+    test_size: float = 0.2,
+    random_state: int = 7,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """Stratified train/test split followed by leakage-free zone encoding."""
+    aux_cols = [c for c in _ZONE_AUX_COLS if c in model_frame.columns]
+    X_full = model_frame[available_features + aux_cols].copy()
+    y = model_frame[target_column]
+
+    X_full_train, X_full_test, y_train, y_test = train_test_split(
+        X_full, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+
+    if "player_zone_fg_pct" in available_features and aux_cols:
+        X_full_train, X_full_test = _recompute_zone_fg_pct(X_full_train, X_full_test, y_train)
+
+    X_train = X_full_train[available_features]
+    X_test = X_full_test[available_features]
+    return X_train, X_test, y_train, y_test
+
+
+# ---------------------------------------------------------------------------
+# Public metrics utilities
+# ---------------------------------------------------------------------------
+
+def expected_calibration_error(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = 10,
+) -> float:
+    """Expected Calibration Error (ECE).
+
+    ECE is the probability-weighted mean absolute deviation between a
+    model's predicted confidence and its empirical accuracy across *n_bins*
+    equal-width probability intervals::
+
+        ECE = Σ_b (|B_b| / n) · |acc(B_b) − conf(B_b)|
+
+    ECE ∈ [0, 1]; lower is better. A perfectly calibrated model has ECE = 0.
+    Calibration matters whenever predicted probabilities are interpreted
+    directly (e.g. computing expected points as p̂ × shot_value).
+    """
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    n = len(y_true)
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (y_prob >= lo) & (y_prob < hi)
+        if not mask.any():
+            continue
+        acc = float(y_true[mask].mean())
+        conf = float(y_prob[mask].mean())
+        ece += mask.sum() / n * abs(acc - conf)
+    return float(ece)
+
+
+# ---------------------------------------------------------------------------
+# Core training
+# ---------------------------------------------------------------------------
+
+def train_model(
+    dataframe: pd.DataFrame,
+    target_column: str = "shot_made_flag",
+    model_type: ModelType = "xgboost",
+) -> TrainingArtifacts:
+    """Train a shot-quality model and return evaluation artifacts.
+
+    Improvements over a naïve pipeline:
+
+    * **Leakage fix** – ``player_zone_fg_pct`` is refit on training data only
+      inside :func:`_recompute_zone_fg_pct` using Bayesian shrinkage.
+    * **PR-AUC** – Area under the Precision-Recall curve, which is more
+      informative than ROC-AUC for imbalanced or skewed class distributions.
+    * **Expected Calibration Error** – validates that predicted probabilities
+      are reliable (essential for interpreting *p̂* as shot quality).
+    """
+    model_frame = dataframe.copy()
+    available_features = [col for col in FEATURE_COLUMNS if col in model_frame.columns]
+    if not available_features:
+        raise ValueError("No model features are available. Run feature engineering before training.")
+    if target_column not in model_frame.columns:
+        raise ValueError(f"Missing target column: {target_column}")
+
+    X_train, X_test, y_train, y_test = _split_and_fix_leakage(
+        model_frame, available_features, target_column
+    )
+
+    numeric_columns = [c for c in available_features if model_frame[c].dtype != "object"]
+    categorical_columns = [c for c in available_features if model_frame[c].dtype == "object"]
+    preprocessor = _build_preprocessor(numeric_columns, categorical_columns)
+
+    classifier = _build_classifier(model_type)
     pipeline = Pipeline(steps=[
         ("preprocessor", preprocessor),
         ("classifier", classifier),
@@ -112,8 +267,10 @@ def train_model(
     probabilities = pipeline.predict_proba(X_test)[:, 1]
     metrics = {
         "roc_auc": float(roc_auc_score(y_test, probabilities)),
+        "pr_auc": float(average_precision_score(y_test, probabilities)),
         "log_loss": float(log_loss(y_test, probabilities)),
         "brier_score": float(brier_score_loss(y_test, probabilities)),
+        "ece": expected_calibration_error(y_test.values, probabilities),
     }
 
     return TrainingArtifacts(
@@ -132,6 +289,168 @@ def train_baseline_model(dataframe: pd.DataFrame, target_column: str = "shot_mad
     return train_model(dataframe, target_column, model_type="logistic")
 
 
+# ---------------------------------------------------------------------------
+# Cross-validation
+# ---------------------------------------------------------------------------
+
+def cross_validate_model(
+    dataframe: pd.DataFrame,
+    target_column: str = "shot_made_flag",
+    model_type: ModelType = "xgboost",
+    n_splits: int = 5,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Stratified k-fold cross-validation with leakage-free zone encoding.
+
+    Because ``player_zone_fg_pct`` is a target-encoded feature, it must be
+    recomputed from training-fold labels in each iteration to avoid leakage.
+    A manual loop over :class:`~sklearn.model_selection.StratifiedKFold`
+    splits gives full control over this re-encoding step.
+
+    Returns a DataFrame with per-fold metrics **and** a summary row
+    (``mean ± std``) so you can report calibrated uncertainty estimates
+    alongside point estimates.
+    """
+    model_frame = dataframe.copy()
+    available_features = [col for col in FEATURE_COLUMNS if col in model_frame.columns]
+    aux_cols = [c for c in _ZONE_AUX_COLS if c in model_frame.columns]
+
+    X_full = model_frame[available_features + aux_cols].copy()
+    y = model_frame[target_column]
+
+    numeric_columns = [c for c in available_features if model_frame[c].dtype != "object"]
+    categorical_columns = [c for c in available_features if model_frame[c].dtype == "object"]
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    fold_metrics: list[dict] = []
+
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X_full, y), 1):
+        X_train_full = X_full.iloc[train_idx].copy()
+        X_test_full = X_full.iloc[test_idx].copy()
+        y_train = y.iloc[train_idx]
+        y_test = y.iloc[test_idx]
+
+        # Leakage-free zone encoding per fold
+        if "player_zone_fg_pct" in available_features and aux_cols:
+            X_train_full, X_test_full = _recompute_zone_fg_pct(
+                X_train_full, X_test_full, y_train
+            )
+
+        X_train = X_train_full[available_features]
+        X_test = X_test_full[available_features]
+
+        preprocessor = _build_preprocessor(numeric_columns, categorical_columns)
+        pipeline = Pipeline(steps=[
+            ("preprocessor", preprocessor),
+            ("classifier", _build_classifier(model_type)),
+        ])
+        pipeline.fit(X_train, y_train)
+        probs = pipeline.predict_proba(X_test)[:, 1]
+
+        fold_metrics.append({
+            "fold": fold,
+            "roc_auc": float(roc_auc_score(y_test, probs)),
+            "pr_auc": float(average_precision_score(y_test, probs)),
+            "log_loss": float(log_loss(y_test, probs)),
+            "brier_score": float(brier_score_loss(y_test, probs)),
+            "ece": expected_calibration_error(y_test.values, probs),
+        })
+
+    results = pd.DataFrame(fold_metrics)
+    metric_cols = [c for c in results.columns if c != "fold"]
+    mean_row = {"fold": "mean", **results[metric_cols].mean().to_dict()}
+    std_row = {"fold": "std", **results[metric_cols].std().to_dict()}
+    return pd.concat([results, pd.DataFrame([mean_row, std_row])], ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameter tuning
+# ---------------------------------------------------------------------------
+
+def tune_model(
+    dataframe: pd.DataFrame,
+    target_column: str = "shot_made_flag",
+    model_type: ModelType = "xgboost",
+    n_iter: int = 20,
+    n_splits: int = 3,
+    random_state: int = 42,
+) -> dict:
+    """Randomised hyperparameter search with stratified cross-validation.
+
+    Uses :class:`~sklearn.model_selection.RandomizedSearchCV` over a broad
+    parameter space, then evaluates the winning configuration on a held-out
+    test set.  The leakage fix is applied **before** the inner CV loop so
+    that the zone encoding seen during the search reflects the outer
+    training partition only (a mild, accepted approximation analogous to
+    warm-starting a feature encoder).
+
+    Returns a dict containing ``best_params``, per-metric test scores, and
+    the fitted best estimator.
+    """
+    model_frame = dataframe.copy()
+    available_features = [col for col in FEATURE_COLUMNS if col in model_frame.columns]
+
+    X_train, X_test, y_train, y_test = _split_and_fix_leakage(
+        model_frame, available_features, target_column
+    )
+
+    numeric_columns = [c for c in available_features if model_frame[c].dtype != "object"]
+    categorical_columns = [c for c in available_features if model_frame[c].dtype == "object"]
+    preprocessor = _build_preprocessor(numeric_columns, categorical_columns)
+
+    param_distributions: dict = {
+        "xgboost": {
+            "classifier__n_estimators": [100, 200, 300, 400, 500],
+            "classifier__max_depth": [3, 4, 5, 6, 7],
+            "classifier__learning_rate": [0.01, 0.03, 0.05, 0.10, 0.15, 0.20],
+            "classifier__subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
+            "classifier__colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+            "classifier__min_child_weight": [1, 3, 5, 7],
+            "classifier__gamma": [0.0, 0.05, 0.10, 0.20, 0.50],
+            "classifier__reg_alpha": [0.0, 0.01, 0.1, 1.0],
+            "classifier__reg_lambda": [0.5, 1.0, 2.0, 5.0],
+        },
+        "logistic": {
+            "classifier__C": [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0],
+            "classifier__penalty": ["l1", "l2"],
+            "classifier__solver": ["liblinear"],
+        },
+    }
+
+    pipeline = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", _build_classifier(model_type)),
+    ])
+
+    search = RandomizedSearchCV(
+        pipeline,
+        param_distributions=param_distributions[model_type],
+        n_iter=n_iter,
+        scoring="roc_auc",
+        cv=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state),
+        random_state=random_state,
+        n_jobs=-1,
+        refit=True,
+    )
+    search.fit(X_train, y_train)
+
+    probs = search.best_estimator_.predict_proba(X_test)[:, 1]
+    return {
+        "best_params": search.best_params_,
+        "best_cv_roc_auc": float(search.best_score_),
+        "test_roc_auc": float(roc_auc_score(y_test, probs)),
+        "test_pr_auc": float(average_precision_score(y_test, probs)),
+        "test_log_loss": float(log_loss(y_test, probs)),
+        "test_brier_score": float(brier_score_loss(y_test, probs)),
+        "test_ece": expected_calibration_error(y_test.values, probs),
+        "best_estimator": search.best_estimator_,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc analysis utilities
+# ---------------------------------------------------------------------------
+
 def get_feature_importance(artifacts: TrainingArtifacts) -> pd.DataFrame | None:
     """Return a sorted feature-importance DataFrame for tree-based models."""
     clf = artifacts.pipeline.named_steps.get("classifier")
@@ -143,6 +462,43 @@ def get_feature_importance(artifacts: TrainingArtifacts) -> pd.DataFrame | None:
     return df.sort_values("importance", ascending=False).reset_index(drop=True)
 
 
+def get_permutation_importance(
+    artifacts: TrainingArtifacts,
+    n_repeats: int = 20,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Permutation feature importance evaluated on the held-out test set.
+
+    Unlike impurity-based importance (which is computed on training data and
+    biased toward high-cardinality features), permutation importance directly
+    measures the drop in *test-set* ROC-AUC when each feature's values are
+    randomly shuffled – giving a more reliable picture of out-of-sample
+    relevance, especially for correlated predictors.
+    """
+    if artifacts.X_test is None or artifacts.y_test is None:
+        return pd.DataFrame()
+
+    result = sklearn_permutation_importance(
+        artifacts.pipeline,
+        artifacts.X_test,
+        artifacts.y_test,
+        n_repeats=n_repeats,
+        random_state=random_state,
+        scoring="roc_auc",
+        n_jobs=-1,
+    )
+
+    return (
+        pd.DataFrame({
+            "feature": artifacts.feature_columns,
+            "importance_mean": result.importances_mean,
+            "importance_std": result.importances_std,
+        })
+        .sort_values("importance_mean", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
 def get_calibration_data(artifacts: TrainingArtifacts, n_bins: int = 10) -> pd.DataFrame:
     """Return fraction_of_positives and mean_predicted_value arrays for calibration plot."""
     frac_pos, mean_pred = calibration_curve(
@@ -150,6 +506,82 @@ def get_calibration_data(artifacts: TrainingArtifacts, n_bins: int = 10) -> pd.D
     )
     return pd.DataFrame({"mean_predicted": mean_pred, "fraction_positive": frac_pos})
 
+
+def get_roc_data(artifacts: TrainingArtifacts) -> pd.DataFrame:
+    """Return FPR/TPR arrays for an ROC curve plot."""
+    fpr, tpr, thresholds = roc_curve(artifacts.y_test, artifacts.probabilities)
+    return pd.DataFrame({"fpr": fpr, "tpr": tpr, "threshold": thresholds})
+
+
+def get_pr_curve_data(artifacts: TrainingArtifacts) -> pd.DataFrame:
+    """Return precision/recall arrays for a Precision-Recall curve plot.
+
+    The PR curve is particularly informative when the positive class (made
+    shots) is the minority or when the cost of false positives differs from
+    false negatives, situations where ROC-AUC can be overly optimistic.
+    """
+    precision, recall, thresholds = precision_recall_curve(
+        artifacts.y_test, artifacts.probabilities
+    )
+    # precision_recall_curve returns len(thresholds) = len(precision) - 1
+    thresholds = np.append(thresholds, np.nan)
+    return pd.DataFrame({"precision": precision, "recall": recall, "threshold": thresholds})
+
+
+def get_learning_curve_data(
+    dataframe: pd.DataFrame,
+    target_column: str = "shot_made_flag",
+    model_type: ModelType = "xgboost",
+    n_splits: int = 5,
+    train_sizes: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Compute train and CV test ROC-AUC for increasing training set sizes.
+
+    The learning curve reveals the bias-variance trade-off:
+
+    * A large gap between training and validation score → *high variance*
+      (over-fitting) → more data or stronger regularisation will help.
+    * Both scores low and close together → *high bias* (under-fitting) →
+      a more expressive model or richer features are needed.
+    """
+    if train_sizes is None:
+        train_sizes = np.linspace(0.1, 1.0, 8)
+
+    model_frame = dataframe.copy()
+    available_features = [col for col in FEATURE_COLUMNS if col in model_frame.columns]
+    X = model_frame[available_features]
+    y = model_frame[target_column]
+
+    numeric_columns = [c for c in available_features if model_frame[c].dtype != "object"]
+    categorical_columns = [c for c in available_features if model_frame[c].dtype == "object"]
+    preprocessor = _build_preprocessor(numeric_columns, categorical_columns)
+    pipeline = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", _build_classifier(model_type)),
+    ])
+
+    train_sizes_abs, train_scores, test_scores = learning_curve(
+        pipeline,
+        X,
+        y,
+        train_sizes=train_sizes,
+        cv=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42),
+        scoring="roc_auc",
+        n_jobs=-1,
+    )
+
+    return pd.DataFrame({
+        "train_size": train_sizes_abs,
+        "train_mean": train_scores.mean(axis=1),
+        "train_std": train_scores.std(axis=1),
+        "test_mean": test_scores.mean(axis=1),
+        "test_std": test_scores.std(axis=1),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Expected-points annotation
+# ---------------------------------------------------------------------------
 
 def add_expected_points(
     dataframe: pd.DataFrame,

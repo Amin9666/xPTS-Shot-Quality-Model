@@ -12,6 +12,36 @@ def add_geometry_features(dataframe: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def add_polynomial_features(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Add non-linear and interaction terms motivated by shot geometry.
+
+    ``distance_sq``
+        Squared distance captures the *accelerating* difficulty of longer
+        shots: empirically the log-odds of making a shot is approximately
+        linear in distance, so make-probability is convex in distance and a
+        squared term helps linear learners (logistic regression) model this
+        without feature crosses.
+
+    ``log_distance``
+        Log-scale distance emphasises the near-basket regime where small
+        changes in range have a large effect on make-probability (the curve
+        is steep inside ~10 ft and flattens beyond the arc).
+
+    ``dist_angle_ix``
+        Distance × |angle| interaction. Shots from the same distance are
+        harder when taken from a severe angle (e.g. extreme left/right),
+        so the product encodes the joint penalty of range and lateral
+        difficulty that neither feature captures alone.
+    """
+    frame = dataframe.copy()
+    if "shot_distance" in frame.columns:
+        frame["distance_sq"] = frame["shot_distance"] ** 2
+        frame["log_distance"] = np.log1p(frame["shot_distance"])
+    if {"shot_distance", "shot_angle"}.issubset(frame.columns):
+        frame["dist_angle_ix"] = frame["shot_distance"] * frame["shot_angle"].abs()
+    return frame
+
+
 def add_game_context_features(dataframe: pd.DataFrame) -> pd.DataFrame:
     frame = dataframe.copy()
     if {"home_score", "away_score"}.issubset(frame.columns):
@@ -49,6 +79,7 @@ def add_zone_history_feature(
 
 def build_model_frame(dataframe: pd.DataFrame) -> pd.DataFrame:
     frame = add_geometry_features(dataframe)
+    frame = add_polynomial_features(frame)
     frame = add_game_context_features(frame)
     frame = add_zone_history_feature(frame)
 
