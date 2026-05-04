@@ -1,8 +1,13 @@
 """
 run_pipeline.py – End-to-end xPTS Shot Quality Model pipeline.
 
-Fetches real NBA shot chart data via nba_api (Stephen Curry, 2023-24 by default),
-engineers features, trains XGBoost + Logistic Regression models, evaluates them
+Data priority:
+  1. Load data/raw/shots.csv if it exists and looks like real NBA data
+     (row count > 5,000 or contains game_id / player_id columns).
+  2. Fetch real NBA data via nba_api for all 30 teams (2023-24 season).
+  3. Fall back to synthetic Curry data (all chart titles marked SYNTHETIC DATA).
+
+Engineers features, trains XGBoost + Logistic Regression models, evaluates them
 with rigorous ML metrics (ROC-AUC, PR-AUC, log-loss, Brier score, ECE), runs
 stratified k-fold cross-validation, performs randomised hyperparameter search,
 and saves a rich set of diagnostic charts + a model artifact.
@@ -13,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 # Allow importing from src/ without an install step
@@ -27,7 +33,6 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from src.data_loader import fetch_player_shot_chart
 from src.features import build_model_frame
 from src.model import (
     train_model,
@@ -49,31 +54,168 @@ OUTPUTS.mkdir(exist_ok=True)
 sns.set_theme(style="darkgrid", palette="muted")
 
 # ---------------------------------------------------------------------------
-# 1. Data  – real NBA shot chart; fallback to synthetic if API is unavailable
+# 1. Data  – priority: saved CSV → full-league nba_api fetch → synthetic
 # ---------------------------------------------------------------------------
 print("=" * 60)
-print("Step 1 – Fetching real shot chart data: Stephen Curry (2023-24) …")
+print("Step 1 – Loading NBA shot data …")
 raw_path = Path("data/raw/shots.csv")
 raw_path.parent.mkdir(parents=True, exist_ok=True)
 
-CACHED_CURRY_PATH = Path("data/raw/steph_curry_2023_24.csv")
+_REAL_DATA_MIN_ROWS = 5_000  # anything above this threshold is treated as real data
+_EPSILON = 1e-9              # small value to avoid atan2 singularity at x=0
+_RETRY_DELAY_SECS = 3.0      # seconds to wait between nba_api retry attempts
+_TEAM_REQUEST_DELAY_SECS = 1.5  # seconds to wait between team requests (rate limiting)
+
+
+def _looks_like_real_data(df: pd.DataFrame) -> bool:
+    """Return True if *df* appears to be real NBA data (not synthetic)."""
+    if len(df) > _REAL_DATA_MIN_ROWS:
+        return True
+    real_cols = {"game_id", "player_id"}
+    return bool(real_cols.intersection(df.columns))
+
+
+def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalise a full-league CSV (notebook 01 schema) to the pipeline schema."""
+    # Lowercase all column names (notebook 01 already does this, but be defensive)
+    df.columns = df.columns.str.lower()
+
+    # event_type → shot_result
+    if "event_type" in df.columns and "shot_result" not in df.columns:
+        df = df.rename(columns={"event_type": "shot_result"})
+
+    # action_type → shot_type (if shot_type missing)
+    if "shot_type" not in df.columns and "action_type" in df.columns:
+        df["shot_type"] = df["action_type"]
+
+    # Derive shot_value from shot_type
+    if "shot_value" not in df.columns:
+        df["shot_value"] = df["shot_type"].apply(lambda t: 3 if "3PT" in str(t) else 2)
+
+    # Derive shot_angle
+    if "shot_angle" not in df.columns:
+        safe_x = df["loc_x"].replace(0, _EPSILON)
+        df["shot_angle"] = np.degrees(np.arctan2(df["loc_y"], safe_x))
+
+    # Placeholder columns not present in the league CSV
+    for col, default in [
+        ("score_diff", 0),
+        ("shot_clock", 12.0),
+        ("home_score", 0),
+        ("away_score", 0),
+        ("true_make_prob", 0.0),
+    ]:
+        if col not in df.columns:
+            df[col] = default
+
+    # Use shot_made_flag as a proxy for true_make_prob when unavailable
+    if (df["true_make_prob"] == 0).all() and "shot_made_flag" in df.columns:
+        df["true_make_prob"] = df["shot_made_flag"].astype(float)
+
+    return df
+
+
+def _fetch_full_league(season: str = "2023-24") -> pd.DataFrame:
+    """Fetch shot-chart data for all 30 NBA teams via nba_api."""
+    from nba_api.stats.endpoints.shotchartdetail import ShotChartDetail  # type: ignore[import]
+    from nba_api.stats.static import teams as nba_teams  # type: ignore[import]
+
+    all_teams = nba_teams.get_teams()
+    frames: list[pd.DataFrame] = []
+    for i, team in enumerate(all_teams, start=1):
+        tid = team["id"]
+        print(f"    Fetching team {i}/{len(all_teams)}: {team['full_name']} …")
+        for attempt in range(3):
+            try:
+                sc = ShotChartDetail(
+                    team_id=tid,
+                    player_id=0,
+                    season_nullable=season,
+                    season_type_all_star="Regular Season",
+                    context_measure_simple="FGA",
+                )
+                df = sc.get_data_frames()[0]
+                frames.append(df)
+                break
+            except Exception as exc:
+                print(f"      attempt {attempt + 1} failed: {exc}", file=sys.stderr)
+                if attempt < 2:
+                    time.sleep(_RETRY_DELAY_SECS)
+        else:
+            print(f"      Skipping {team['full_name']} after 3 failures.", file=sys.stderr)
+        time.sleep(_TEAM_REQUEST_DELAY_SECS)
+
+    if not frames:
+        raise RuntimeError("nba_api returned no data for any team")
+
+    result = pd.concat(frames, ignore_index=True)
+    result.columns = result.columns.str.lower()
+    return result
+
 
 using_real_data = True
-try:
-    shots_raw = fetch_player_shot_chart(player_id=201939, season="2023-24")
-    chart_title = "Stephen Curry 2023-24 Shot Chart – Coloured by xPTS"
-    print(f"  ✓ Data source: REAL NBA data (nba_api) — {len(shots_raw):,} real shots fetched")
-except Exception as exc:
-    print(f"  WARNING: nba_api fetch failed ({type(exc).__name__}: {exc})", file=sys.stderr)
-    if CACHED_CURRY_PATH.exists():
-        shots_raw = pd.read_csv(CACHED_CURRY_PATH)
-        chart_title = "Stephen Curry 2023-24 Shot Chart – Coloured by xPTS (Cached)"
-        print(f"  ✓ Data source: CACHED realistic Curry data — {len(shots_raw):,} shots loaded from {CACHED_CURRY_PATH}")
+shots_raw: pd.DataFrame
+
+# ── Priority 1: existing data/raw/shots.csv ──────────────────────────────────
+if raw_path.exists():
+    _candidate = pd.read_csv(raw_path)
+    if _looks_like_real_data(_candidate):
+        shots_raw = _normalise_league_csv(_candidate)
+        chart_title = "NBA 2023-24 League Shot Chart – Coloured by xPTS"
+        print(
+            f"  ✓ Data source: REAL NBA data (data/raw/shots.csv) — "
+            f"{len(shots_raw):,} shots loaded"
+        )
     else:
-        print("  WARNING: cached data not found, falling back to synthetic data.", file=sys.stderr)
+        print(
+            f"  data/raw/shots.csv exists but looks synthetic ({len(_candidate):,} rows). "
+            "Trying nba_api …"
+        )
+
+        # ── Priority 2: fetch full league via nba_api ─────────────────────────
+        try:
+            print("  Fetching full 2023-24 league shot data via nba_api (all 30 teams) …")
+            shots_raw = _fetch_full_league(season="2023-24")
+            shots_raw = _normalise_league_csv(shots_raw)
+            shots_raw.to_csv(raw_path, index=False)
+            chart_title = "NBA 2023-24 League Shot Chart – Coloured by xPTS"
+            print(
+                f"  ✓ Data source: REAL NBA data (nba_api, all teams) — "
+                f"{len(shots_raw):,} shots fetched and saved → {raw_path}"
+            )
+        except Exception as exc:
+            print(
+                f"  WARNING: nba_api fetch failed ({type(exc).__name__}: {exc}). "
+                "Falling back to synthetic data.",
+                file=sys.stderr,
+            )
+            from src.generate_synthetic_data import generate_curry_shots
+            shots_raw = generate_curry_shots()
+            chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
+            using_real_data = False
+            print(f"  ✓ Data source: SYNTHETIC Curry data — {len(shots_raw):,} shots generated")
+else:
+    # ── Priority 2: fetch full league via nba_api ─────────────────────────────
+    try:
+        print("  data/raw/shots.csv not found. Fetching full 2023-24 league data via nba_api …")
+        shots_raw = _fetch_full_league(season="2023-24")
+        shots_raw = _normalise_league_csv(shots_raw)
+        shots_raw.to_csv(raw_path, index=False)
+        chart_title = "NBA 2023-24 League Shot Chart – Coloured by xPTS"
+        print(
+            f"  ✓ Data source: REAL NBA data (nba_api, all teams) — "
+            f"{len(shots_raw):,} shots fetched and saved → {raw_path}"
+        )
+    except Exception as exc:
+        # ── Priority 3: synthetic fallback ────────────────────────────────────
+        print(
+            f"  WARNING: nba_api fetch failed ({type(exc).__name__}: {exc}). "
+            "Falling back to synthetic data.",
+            file=sys.stderr,
+        )
         from src.generate_synthetic_data import generate_curry_shots
         shots_raw = generate_curry_shots()
-        chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (Synthetic)"
+        chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
         using_real_data = False
         print(f"  ✓ Data source: SYNTHETIC Curry data — {len(shots_raw):,} shots generated")
 
@@ -171,14 +313,16 @@ ax.set_facecolor("#1a1a2e")
 fig.patch.set_facecolor("#1a1a2e")
 draw_half_court(ax, color="#555577")
 
-# For synthetic data, restrict the chart to Curry's shots only so the
-# visualisation reflects *his* shot selection rather than a mixture of
-# all 10 synthetic players.
-if using_real_data or shots["player_name"].nunique() == 1:
+# For the full-league dataset sample up to 3,000 shots for readability.
+# For synthetic data restrict to Curry's shots only.
+if using_real_data:
     chart_shots = shots
 else:
-    chart_shots = shots[shots["player_name"] == "Stephen Curry"]
-    chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (Synthetic Data)"
+    if shots["player_name"].nunique() > 1:
+        chart_shots = shots[shots["player_name"] == "Stephen Curry"]
+        chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
+    else:
+        chart_shots = shots
 
 sample = chart_shots.sample(min(3000, len(chart_shots)), random_state=1)
 sc = ax.scatter(
@@ -216,7 +360,10 @@ ax.plot(cal_lr["mean_predicted"], cal_lr["fraction_positive"],
               f" ECE={lr_artifacts.metrics['ece']:.3f})")
 ax.set_xlabel("Mean Predicted Probability")
 ax.set_ylabel("Fraction of Positives (Actual Make Rate)")
-ax.set_title("Calibration Curves – Shot Make Probability")
+_cal_title = "Calibration Curves – Shot Make Probability"
+if not using_real_data:
+    _cal_title += " (SYNTHETIC DATA)"
+ax.set_title(_cal_title)
 ax.legend()
 plt.tight_layout()
 plt.savefig(OUTPUTS / "calibration_curves.png", dpi=150, bbox_inches="tight")
@@ -233,7 +380,10 @@ for arts, label in [(xgb_artifacts, "XGBoost"), (lr_artifacts, "Logistic Regress
 ax.plot([0, 1], [0, 1], "k--", lw=1.2)
 ax.set_xlabel("False Positive Rate")
 ax.set_ylabel("True Positive Rate")
-ax.set_title("ROC Curves – Shot Make Prediction")
+_roc_title = "ROC Curves – Shot Make Prediction"
+if not using_real_data:
+    _roc_title += " (SYNTHETIC DATA)"
+ax.set_title(_roc_title)
 ax.legend()
 plt.tight_layout()
 plt.savefig(OUTPUTS / "roc_curves.png", dpi=150, bbox_inches="tight")
@@ -252,7 +402,10 @@ ax.axhline(baseline, color="k", linestyle="--", lw=1.2,
            label=f"No-skill baseline ({baseline:.3f})")
 ax.set_xlabel("Recall")
 ax.set_ylabel("Precision")
-ax.set_title("Precision-Recall Curves – Shot Make Prediction")
+_pr_title = "Precision-Recall Curves – Shot Make Prediction"
+if not using_real_data:
+    _pr_title += " (SYNTHETIC DATA)"
+ax.set_title(_pr_title)
 ax.legend()
 plt.tight_layout()
 plt.savefig(OUTPUTS / "pr_curves.png", dpi=150, bbox_inches="tight")
@@ -267,7 +420,10 @@ if fi is not None:
     colors = sns.color_palette("viridis", len(fi))
     ax.barh(fi["feature"], fi["importance"], color=colors)
     ax.set_xlabel("Feature Importance (Gain)")
-    ax.set_title("XGBoost – Impurity-Based Feature Importance")
+    _fi_title = "XGBoost – Impurity-Based Feature Importance"
+    if not using_real_data:
+        _fi_title += " (SYNTHETIC DATA)"
+    ax.set_title(_fi_title)
     ax.invert_yaxis()
     plt.tight_layout()
     plt.savefig(OUTPUTS / "feature_importance.png", dpi=150, bbox_inches="tight")
@@ -286,7 +442,10 @@ if not perm_imp.empty:
             capsize=3)
     ax.axvline(0, color="k", lw=0.8, linestyle="--")
     ax.set_xlabel("Mean decrease in ROC-AUC (20 permutations ± std)")
-    ax.set_title("XGBoost – Permutation Feature Importance (Test Set)")
+    _perm_title = "XGBoost – Permutation Feature Importance (Test Set)"
+    if not using_real_data:
+        _perm_title += " (SYNTHETIC DATA)"
+    ax.set_title(_perm_title)
     ax.invert_yaxis()
     plt.tight_layout()
     plt.savefig(OUTPUTS / "permutation_importance.png", dpi=150, bbox_inches="tight")
@@ -312,7 +471,10 @@ ax.plot(lc["train_size"], lc["train_mean"], "o-", lw=2, label="Training ROC-AUC"
 ax.plot(lc["train_size"], lc["test_mean"],  "s-", lw=2, label="CV Validation ROC-AUC")
 ax.set_xlabel("Training Set Size")
 ax.set_ylabel("ROC-AUC")
-ax.set_title("Learning Curves – XGBoost (Bias-Variance Diagnostic)")
+_lc_title = "Learning Curves – XGBoost (Bias-Variance Diagnostic)"
+if not using_real_data:
+    _lc_title += " (SYNTHETIC DATA)"
+ax.set_title(_lc_title)
 ax.legend()
 plt.tight_layout()
 plt.savefig(OUTPUTS / "learning_curves.png", dpi=150, bbox_inches="tight")
@@ -335,19 +497,26 @@ player_summary = (
 player_summary["xpts_vs_average"] = player_summary["avg_xpts"] - player_summary["avg_xpts"].mean()
 
 if player_summary.shape[0] > 1:
-    # Multi-player comparison
+    # Multi-player comparison – limit to top 20 by shot volume for readability
+    top20 = (
+        player_summary.nlargest(20, "shots_taken")
+        .sort_values("avg_xpts", ascending=False)
+        .reset_index(drop=True)
+    )
+    top20["xpts_vs_average"] = top20["avg_xpts"] - player_summary["avg_xpts"].mean()
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    palette = ["#2ecc71" if v >= 0 else "#e74c3c" for v in player_summary["xpts_vs_average"]]
-    axes[0].barh(player_summary["player_name"], player_summary["avg_xpts"], color=palette)
+    palette = ["#2ecc71" if v >= 0 else "#e74c3c" for v in top20["xpts_vs_average"]]
+    axes[0].barh(top20["player_name"], top20["avg_xpts"], color=palette)
     axes[0].axvline(player_summary["avg_xpts"].mean(), color="white", linestyle="--", lw=1.5,
-                    label=f"League avg {player_summary['avg_xpts'].mean():.3f}")
+                    label=f"Full league avg {player_summary['avg_xpts'].mean():.3f}")
     axes[0].set_xlabel("Average xPTS per Shot Attempt")
-    axes[0].set_title("Average xPTS by Player")
+    axes[0].set_title("Average xPTS by Player (Top 20 by Volume)")
     axes[0].legend()
     axes[0].invert_yaxis()
 
-    for _, row in player_summary.iterrows():
+    for _, row in top20.iterrows():
         axes[1].scatter(row["avg_xpts"], row["make_rate"], s=120, zorder=3)
         axes[1].annotate(
             row["player_name"].split()[-1],
@@ -356,9 +525,12 @@ if player_summary.shape[0] > 1:
         )
     axes[1].set_xlabel("Average xPTS")
     axes[1].set_ylabel("Actual Make Rate")
-    axes[1].set_title("xPTS vs Actual Make Rate by Player")
+    axes[1].set_title("xPTS vs Actual Make Rate by Player (Top 20 by Volume)")
 
-    plt.suptitle("Player-Level Shot Quality Summary", fontsize=14, y=1.02)
+    _ps_suptitle = "Player-Level Shot Quality Summary"
+    if not using_real_data:
+        _ps_suptitle += " (SYNTHETIC DATA)"
+    plt.suptitle(_ps_suptitle, fontsize=14, y=1.02)
 else:
     # Single-player view: show shot selection (volume) and quality by zone
     player_name = player_summary["player_name"].iloc[0]
@@ -386,7 +558,9 @@ else:
     axes[1].set_title("Shot Quality (avg xPTS) by Zone")
     axes[1].invert_yaxis()
 
-    plt.suptitle(f"{player_name} – Shot Selection & Quality by Zone", fontsize=14, y=1.02)
+    plt.suptitle(f"{player_name} – Shot Selection & Quality by Zone"
+                 + (" (SYNTHETIC DATA)" if not using_real_data else ""),
+                 fontsize=14, y=1.02)
 
 plt.tight_layout()
 plt.savefig(OUTPUTS / "player_summary.png", dpi=150, bbox_inches="tight")
@@ -407,7 +581,10 @@ sns.violinplot(
 )
 ax.set_xticks(range(len(zone_order)))
 ax.set_xticklabels(zone_order, rotation=30, ha="right")
-ax.set_title("xPTS Distribution by Shot Zone")
+_zone_title = "xPTS Distribution by Shot Zone"
+if not using_real_data:
+    _zone_title += " (SYNTHETIC DATA)"
+ax.set_title(_zone_title)
 ax.set_xlabel("Shot Zone")
 ax.set_ylabel("Expected Points (xPTS)")
 plt.tight_layout()
