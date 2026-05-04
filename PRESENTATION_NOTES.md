@@ -10,7 +10,7 @@
 **NBA Shot Chart – Where Are the Best Shots?**
 
 ### Bullet Points (on slide)
-- Each dot = one shot attempt, coloured by **Expected Points (xPTS)**
+- Each dot = one **real shot attempt** — coloured by model-predicted xPTS
 - **Green** = high-value shot (near basket, corner 3)
 - **Red** = low-value shot (long mid-range, extreme angle)
 - xPTS = *P(make)* × *shot value* (2 or 3 pts)

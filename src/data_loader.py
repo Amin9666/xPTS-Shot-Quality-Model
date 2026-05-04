@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,25 +87,52 @@ def fetch_player_shot_chart(
     RuntimeError
         If the nba_api request fails for any reason.
     """
+    import requests  # type: ignore[import]
+
     from nba_api.stats.endpoints.shotchartdetail import ShotChartDetail  # type: ignore[import]
 
     time.sleep(0.6)  # respect NBA API rate limits
 
-    try:
-        shot_chart = ShotChartDetail(
-            player_id=player_id,
-            team_id=0,
-            season_nullable=season,
-            season_type_all_star="Regular Season",
-            context_measure_simple="FGA",
-        )
-        raw = shot_chart.get_data_frames()[0]
-    except Exception as exc:
+    _MAX_RETRIES = 3
+    _RETRY_SLEEP = 30
+
+    raw: pd.DataFrame | None = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            shot_chart = ShotChartDetail(
+                player_id=player_id,
+                team_id=0,
+                season_nullable=season,
+                season_type_all_star="Regular Season",
+                context_measure_simple="FGA",
+            )
+            raw = shot_chart.get_data_frames()[0]
+            break  # success
+        except (json.JSONDecodeError, requests.exceptions.ReadTimeout) as exc:
+            if attempt < _MAX_RETRIES:
+                print(
+                    f"  [nba_api] Attempt {attempt}/{_MAX_RETRIES} failed "
+                    f"({type(exc).__name__}: {exc}). "
+                    f"Retrying in {_RETRY_SLEEP}s …"
+                )
+                time.sleep(_RETRY_SLEEP)
+            else:
+                raise RuntimeError(
+                    f"nba_api request failed after {_MAX_RETRIES} attempts "
+                    f"for player_id={player_id}, season={season!r}. "
+                    f"Original error: {exc}"
+                ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"nba_api request failed for player_id={player_id}, season={season!r}. "
+                "Check your network connection and that nba_api is installed correctly. "
+                f"Original error: {exc}"
+            ) from exc
+
+    if raw is None:  # should never be reached, but guards against future changes
         raise RuntimeError(
-            f"nba_api request failed for player_id={player_id}, season={season!r}. "
-            "Check your network connection and that nba_api is installed correctly. "
-            f"Original error: {exc}"
-        ) from exc
+            f"nba_api request returned no data for player_id={player_id}, season={season!r}."
+        )
 
     # Rename raw NBA API columns to the pipeline schema
     column_map = {
