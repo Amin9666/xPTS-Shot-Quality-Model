@@ -1,0 +1,57 @@
+name: Run xPTS Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "run_pipeline.py"
+      - "requirements.txt"
+      - "notebooks/**"
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          PYTHONUNBUFFERED: "1"
+        timeout-minutes: 15
+        run: python run_pipeline.py
+
+      - name: Commit and push outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add outputs/
+          if git diff --staged --quiet; then
+            echo "No output changes to commit"
+          else
+            git commit -m "chore(outputs): regenerate pipeline outputs [skip ci]"
+            git push
+          fi

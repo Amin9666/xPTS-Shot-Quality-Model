@@ -1,10 +1,22 @@
 # xPTS Shot Quality Model
 
+![Pipeline](https://github.com/Amin9666/xPTS-Shot-Quality-Model/actions/workflows/run_pipeline.yml/badge.svg)
+
 An end-to-end NBA analytics project for estimating expected points from a shot attempt by modeling shot quality beyond raw make or miss outcomes.
 
 ## Problem Statement
 
 NBA teams and analysts need a better way to evaluate shot selection than field goal percentage alone. A make or miss is noisy on a single possession, but the underlying quality of the shot is more stable. This project builds an `xPTS` style shot quality model that estimates the expected value of each shot attempt using contextual features such as distance, angle, clock pressure, and shooter tendencies.
+
+## CI / Automation
+
+A GitHub Actions workflow ([`.github/workflows/run_pipeline.yml`](.github/workflows/run_pipeline.yml)) runs automatically on every push to `main` when source files change. It:
+
+- Re-runs `python run_pipeline.py` end-to-end (data fetch → features → model → charts)
+- Commits updated charts and CSVs back to `outputs/` with the message `chore(outputs): regenerate pipeline outputs [skip ci]`
+- Uses `[skip ci]` in the commit message to prevent the outputs commit from triggering another run (no infinite loops)
+
+No secrets or credentials are needed — `nba_api` uses public NBA endpoints and the pipeline automatically falls back to synthetic data if the API is unavailable.
 
 ## Project Goals
 
