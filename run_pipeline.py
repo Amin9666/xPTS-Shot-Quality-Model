@@ -164,7 +164,16 @@ ax.set_facecolor("#1a1a2e")
 fig.patch.set_facecolor("#1a1a2e")
 draw_half_court(ax, color="#555577")
 
-sample = shots.sample(min(3000, len(shots)), random_state=1)
+# For synthetic data, restrict the chart to Curry's shots only so the
+# visualisation reflects *his* shot selection rather than a mixture of
+# all 10 synthetic players.
+if using_real_data or shots["player_name"].nunique() == 1:
+    chart_shots = shots
+else:
+    chart_shots = shots[shots["player_name"] == "Stephen Curry"]
+    chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (Synthetic Data)"
+
+sample = chart_shots.sample(min(3000, len(chart_shots)), random_state=1)
 sc = ax.scatter(
     sample["loc_x"], sample["loc_y"],
     c=sample["xpts"], cmap="RdYlGn",
@@ -318,29 +327,60 @@ player_summary = (
 )
 player_summary["xpts_vs_average"] = player_summary["avg_xpts"] - player_summary["avg_xpts"].mean()
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+if player_summary.shape[0] > 1:
+    # Multi-player comparison
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-palette = ["#2ecc71" if v >= 0 else "#e74c3c" for v in player_summary["xpts_vs_average"]]
-axes[0].barh(player_summary["player_name"], player_summary["avg_xpts"], color=palette)
-axes[0].axvline(player_summary["avg_xpts"].mean(), color="white", linestyle="--", lw=1.5,
-                label=f"League avg {player_summary['avg_xpts'].mean():.3f}")
-axes[0].set_xlabel("Average xPTS per Shot Attempt")
-axes[0].set_title("Average xPTS by Player")
-axes[0].legend()
-axes[0].invert_yaxis()
+    palette = ["#2ecc71" if v >= 0 else "#e74c3c" for v in player_summary["xpts_vs_average"]]
+    axes[0].barh(player_summary["player_name"], player_summary["avg_xpts"], color=palette)
+    axes[0].axvline(player_summary["avg_xpts"].mean(), color="white", linestyle="--", lw=1.5,
+                    label=f"League avg {player_summary['avg_xpts'].mean():.3f}")
+    axes[0].set_xlabel("Average xPTS per Shot Attempt")
+    axes[0].set_title("Average xPTS by Player")
+    axes[0].legend()
+    axes[0].invert_yaxis()
 
-for _, row in player_summary.iterrows():
-    axes[1].scatter(row["avg_xpts"], row["make_rate"], s=120, zorder=3)
-    axes[1].annotate(
-        row["player_name"].split()[-1],
-        (row["avg_xpts"], row["make_rate"]),
-        xytext=(4, 2), textcoords="offset points", fontsize=8,
+    for _, row in player_summary.iterrows():
+        axes[1].scatter(row["avg_xpts"], row["make_rate"], s=120, zorder=3)
+        axes[1].annotate(
+            row["player_name"].split()[-1],
+            (row["avg_xpts"], row["make_rate"]),
+            xytext=(4, 2), textcoords="offset points", fontsize=8,
+        )
+    axes[1].set_xlabel("Average xPTS")
+    axes[1].set_ylabel("Actual Make Rate")
+    axes[1].set_title("xPTS vs Actual Make Rate by Player")
+
+    plt.suptitle("Player-Level Shot Quality Summary", fontsize=14, y=1.02)
+else:
+    # Single-player view: show shot selection (volume) and quality by zone
+    player_name = player_summary["player_name"].iloc[0]
+    zone_summary = (
+        shots.groupby("shot_zone_basic")
+        .agg(
+            shots_taken=("xpts", "count"),
+            avg_xpts=("xpts", "mean"),
+            make_rate=("shot_made_flag", "mean"),
+        )
+        .sort_values("shots_taken", ascending=False)
+        .reset_index()
     )
-axes[1].set_xlabel("Average xPTS")
-axes[1].set_ylabel("Actual Make Rate")
-axes[1].set_title("xPTS vs Actual Make Rate by Player")
+    zone_colors = sns.color_palette("Set2", len(zone_summary))
 
-plt.suptitle("Player-Level Shot Quality Summary", fontsize=14, y=1.02)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    axes[0].barh(zone_summary["shot_zone_basic"], zone_summary["shots_taken"], color=zone_colors)
+    axes[0].set_xlabel("Shots Taken")
+    axes[0].set_title("Shot Volume by Zone (Selection)")
+    axes[0].invert_yaxis()
+
+    axes[1].barh(zone_summary["shot_zone_basic"], zone_summary["avg_xpts"], color=zone_colors)
+    axes[1].set_xlabel("Average xPTS per Shot Attempt")
+    axes[1].set_title("Shot Quality (avg xPTS) by Zone")
+    axes[1].invert_yaxis()
+
+    plt.suptitle(f"{player_name} – Shot Selection & Quality by Zone", fontsize=14, y=1.02)
+
 plt.tight_layout()
 plt.savefig(OUTPUTS / "player_summary.png", dpi=150, bbox_inches="tight")
 plt.close()
