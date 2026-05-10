@@ -78,11 +78,107 @@ def add_zone_history_feature(
     return frame.merge(history, on=[player_column, zone_column], how="left")
 
 
+def _name_court_region(cx: float, cy: float) -> str:
+    """Return a basketball zone label for a court position (tenths-of-a-foot coords).
+
+    The NBA shot-chart coordinate system places the basket at (0, 0), with
+    ``loc_x`` spanning −250 to +250 (left–right) and ``loc_y`` running from
+    −52 (behind backboard) upward toward half-court (~470).  All thresholds
+    below are expressed in the same tenths-of-a-foot units.
+    """
+    dist = float(np.sqrt(cx ** 2 + cy ** 2))
+    abs_cx = float(abs(cx))
+    if dist < 60:
+        return "Rim"
+    if dist < 130:
+        return "Paint"
+    if dist < 220:
+        return "Mid-Range"
+    # 3-point territory
+    if cy < 90 and abs_cx > 200:
+        return "Corner 3"
+    if abs_cx > 165:
+        return "Wing 3"
+    return "Above-Break 3"
+
+
+def add_shot_archetype_clusters(
+    dataframe: pd.DataFrame,
+    n_clusters: int = 6,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Cluster shots into spatial archetypes using K-Means on court coordinates.
+
+    Each cluster is assigned a human-readable basketball label derived from
+    the cluster centroid's court region (e.g. "Rim", "Wing 3", "Corner 3").
+    The resulting ``shot_archetype`` column is intended for post-hoc analysis
+    and visualisation rather than as a direct model input.
+
+    Parameters
+    ----------
+    n_clusters:
+        Number of K-Means clusters.  Six is a natural choice that roughly
+        corresponds to the main strategic shot locations in the NBA.
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler as _SS
+
+    frame = dataframe.copy()
+    coord_cols = [c for c in ("loc_x", "loc_y") if c in frame.columns]
+    if len(coord_cols) < 2:
+        frame["shot_archetype"] = "Unknown"
+        return frame
+
+    coords = frame[["loc_x", "loc_y"]].fillna(0).values.astype(float)
+    scaled = _SS().fit_transform(coords)
+
+    km = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    labels = km.fit_predict(scaled)
+
+    # Name each cluster by its average court position
+    cluster_names: dict[int, str] = {}
+    for cid in range(n_clusters):
+        mask = labels == cid
+        cx = float(frame["loc_x"].values[mask].mean())
+        cy = float(frame["loc_y"].values[mask].mean())
+        cluster_names[cid] = _name_court_region(cx, cy)
+
+    frame["shot_archetype"] = [cluster_names[lbl] for lbl in labels]
+    return frame
+
+
+def add_shot_decision_quality(
+    dataframe: pd.DataFrame,
+    xpts_column: str = "xpts",
+    zone_column: str = "shot_zone_basic",
+) -> pd.DataFrame:
+    """Add a ``decision_quality`` column measuring each shot's xPTS above/below zone average.
+
+    Shot decision quality = xPTS(shot) − mean(xPTS | shot_zone)
+
+    A positive value means the shooter generated a better look than the
+    league average for that zone; negative means it was below average.
+    This separates *shot selection* (did you take the right shot?) from
+    *execution* (did you make it?), a distinction central to modern
+    offensive evaluation.
+
+    Requires ``xpts_column`` to already be present (i.e. call after
+    :func:`~src.model.add_expected_points`).
+    """
+    frame = dataframe.copy()
+    if xpts_column not in frame.columns or zone_column not in frame.columns:
+        return frame
+    zone_avg = frame.groupby(zone_column)[xpts_column].transform("mean")
+    frame["decision_quality"] = frame[xpts_column] - zone_avg
+    return frame
+
+
 def build_model_frame(dataframe: pd.DataFrame) -> pd.DataFrame:
     frame = add_geometry_features(dataframe)
     frame = add_polynomial_features(frame)
     frame = add_game_context_features(frame)
     frame = add_zone_history_feature(frame)
+    frame = add_shot_archetype_clusters(frame)
 
     if "shot_made_flag" not in frame.columns and "shot_result" in frame.columns:
         frame["shot_made_flag"] = frame["shot_result"].astype(str).str.lower().eq("made shot").astype(int)

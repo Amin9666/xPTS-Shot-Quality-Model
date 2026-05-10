@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -7,7 +8,7 @@ from typing import Literal, Optional
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.calibration import calibration_curve
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance as sklearn_permutation_importance
@@ -44,6 +45,44 @@ FEATURE_COLUMNS = [
     "late_clock",
     "shot_clock",
 ]
+
+# Three feature tiers for ablation study
+# Each tier adds a new group of predictors so the incremental value
+# of geometry → game context → player skill can be quantified.
+FEATURE_TIERS: dict[str, list[str]] = {
+    "Location Only": [
+        "shot_distance",
+        "shot_angle",
+        "distance_sq",
+        "log1p_distance",
+        "dist_angle_ix",
+    ],
+    "Location + Context": [
+        "shot_distance",
+        "shot_angle",
+        "distance_sq",
+        "log1p_distance",
+        "dist_angle_ix",
+        "period",
+        "game_seconds_remaining",
+        "score_diff_abs",
+        "late_clock",
+        "shot_clock",
+    ],
+    "Full (+ Player Skill)": [
+        "shot_distance",
+        "shot_angle",
+        "distance_sq",
+        "log1p_distance",
+        "dist_angle_ix",
+        "period",
+        "game_seconds_remaining",
+        "score_diff_abs",
+        "late_clock",
+        "shot_clock",
+        "player_zone_fg_pct",
+    ],
+}
 
 # Auxiliary columns needed for leakage-free zone encoding – not used as
 # model inputs directly, but passed alongside X so the encoder can refit
@@ -614,3 +653,239 @@ def save_artifacts(artifacts: TrainingArtifacts, output_path: str | Path) -> Pat
         path,
     )
     return path
+
+
+# ---------------------------------------------------------------------------
+# Ablation study
+# ---------------------------------------------------------------------------
+
+def run_ablation_study(
+    dataframe: pd.DataFrame,
+    target_column: str = "shot_made_flag",
+    model_type: ModelType = "xgboost",
+    test_size: float = 0.2,
+    random_state: int = 7,
+) -> pd.DataFrame:
+    """Quantify the incremental predictive value of each feature tier.
+
+    Trains the same model type (XGBoost by default) three times, each with
+    a progressively richer feature set, using the **same** train/test split:
+
+    1. **Location Only** – pure geometry (distance, angle, polynomial terms).
+    2. **Location + Context** – adds game-state variables (period, clock, score).
+    3. **Full (+ Player Skill)** – adds Bayesian-smoothed player-zone efficiency.
+
+    Comparing ROC-AUC and Log-Loss across tiers answers the research question:
+    *How much of shot outcome variance is explained by geometry vs context vs
+    player skill?*
+
+    Returns a DataFrame with one row per tier and columns for each metric
+    plus ``tier`` (name), ``n_features`` (feature count), and ``delta_roc_auc``
+    (incremental AUC gain over the previous tier).
+    """
+    model_frame = dataframe.copy()
+    rows: list[dict] = []
+
+    # Use a fixed split across all tiers so comparisons are valid
+    # The full feature set is used for the initial split; subsets are
+    # taken from the same indices afterward.
+    full_features = FEATURE_TIERS["Full (+ Player Skill)"]
+    available_full = [f for f in full_features if f in model_frame.columns]
+    aux_cols = [c for c in _ZONE_AUX_COLS if c in model_frame.columns]
+
+    X_full_all = model_frame[available_full + aux_cols].copy()
+    y = model_frame[target_column]
+
+    X_all_train, X_all_test, y_train, y_test = train_test_split(
+        X_full_all, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+
+    prev_auc: float | None = None
+    for tier_name, tier_features in FEATURE_TIERS.items():
+        available = [f for f in tier_features if f in model_frame.columns]
+        if not available:
+            continue
+
+        try:
+            # Apply leakage fix only for the tier that includes player_zone_fg_pct
+            X_train_tier = X_all_train[available + aux_cols].copy()
+            X_test_tier = X_all_test[available + aux_cols].copy()
+
+            if "player_zone_fg_pct" in available and aux_cols:
+                X_train_tier, X_test_tier = _recompute_zone_fg_pct(
+                    X_train_tier, X_test_tier, y_train
+                )
+
+            X_train = X_train_tier[available]
+            X_test = X_test_tier[available]
+
+            numeric_cols = [c for c in available if model_frame[c].dtype != "object"]
+            categorical_cols = [c for c in available if model_frame[c].dtype == "object"]
+            preprocessor = _build_preprocessor(numeric_cols, categorical_cols)
+
+            pipeline = Pipeline(steps=[
+                ("preprocessor", preprocessor),
+                ("classifier", _build_classifier(model_type)),
+            ])
+            pipeline.fit(X_train, y_train)
+            probs = pipeline.predict_proba(X_test)[:, 1]
+
+            auc = float(roc_auc_score(y_test, probs))
+            row: dict = {
+                "tier": tier_name,
+                "n_features": len(available),
+                "roc_auc": auc,
+                "pr_auc": float(average_precision_score(y_test, probs)),
+                "log_loss": float(log_loss(y_test, probs)),
+                "brier_score": float(brier_score_loss(y_test, probs)),
+                "ece": expected_calibration_error(y_test.values, probs),
+                "delta_roc_auc": (auc - prev_auc) if prev_auc is not None else float("nan"),
+            }
+            rows.append(row)
+            prev_auc = auc
+
+        except Exception as exc:
+            print(
+                f"  Ablation: tier '{tier_name}' skipped — {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap confidence intervals
+# ---------------------------------------------------------------------------
+
+def bootstrap_metric_ci(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bootstrap: int = 500,
+    ci: float = 0.95,
+    random_state: int = 42,
+) -> dict[str, tuple[float, float, float]]:
+    """Bootstrap confidence intervals for held-out test-set metrics.
+
+    Resamples ``(y_true, y_prob)`` with replacement *n_bootstrap* times and
+    computes the empirical *ci*% confidence interval for each metric.  This
+    quantifies the uncertainty in point-estimate metrics (e.g. ROC-AUC)
+    arising from the finite test-set size.
+
+    Parameters
+    ----------
+    y_true, y_prob:
+        Ground-truth labels and predicted probabilities from the test set.
+    n_bootstrap:
+        Number of bootstrap resamples.  500 is sufficient for 95% CIs.
+    ci:
+        Desired confidence level (default: 0.95 → 95% CI).
+
+    Returns
+    -------
+    dict mapping metric name → (mean, lower_bound, upper_bound)
+    """
+    rng = np.random.default_rng(random_state)
+    n = len(y_true)
+    alpha = (1.0 - ci) / 2.0
+
+    boot: dict[str, list[float]] = {
+        "roc_auc": [],
+        "pr_auc": [],
+        "log_loss": [],
+        "brier_score": [],
+    }
+
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        yt = y_true[idx]
+        yp = y_prob[idx]
+        # Skip degenerate bootstrap samples (only one class present)
+        if yt.sum() == 0 or yt.sum() == n:
+            continue
+        boot["roc_auc"].append(float(roc_auc_score(yt, yp)))
+        boot["pr_auc"].append(float(average_precision_score(yt, yp)))
+        boot["log_loss"].append(float(log_loss(yt, yp)))
+        boot["brier_score"].append(float(brier_score_loss(yt, yp)))
+
+    output: dict[str, tuple[float, float, float]] = {}
+    for metric, values in boot.items():
+        arr = np.array(values)
+        output[metric] = (
+            float(arr.mean()),
+            float(np.percentile(arr, 100.0 * alpha)),
+            float(np.percentile(arr, 100.0 * (1.0 - alpha))),
+        )
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc calibrated model
+# ---------------------------------------------------------------------------
+
+def train_calibrated_model(
+    dataframe: pd.DataFrame,
+    target_column: str = "shot_made_flag",
+    model_type: ModelType = "xgboost",
+    method: str = "isotonic",
+    cv: int = 5,
+) -> TrainingArtifacts:
+    """Train with post-hoc probability calibration (CalibratedClassifierCV).
+
+    Wraps the base classifier in
+    :class:`~sklearn.calibration.CalibratedClassifierCV` using *cv*-fold
+    cross-validation to fit an isotonic regression (or Platt sigmoid) on top
+    of the classifier's raw probability estimates.
+
+    **Why this matters for xPTS:** the expected-points formula
+    ``xPTS = P̂(make) × shot_value`` is sensitive to calibration quality.
+    A model that is systematically over-confident (P̂ > true rate) inflates
+    xPTS for high-probability shots; one that is under-confident deflates it.
+    Isotonic calibration corrects this systematic bias monotonically.
+
+    The calibrated model typically has lower ECE than the uncalibrated version
+    while sacrificing minimal ROC-AUC, making it a strong candidate for
+    deployment when probability magnitudes matter.
+    """
+    model_frame = dataframe.copy()
+    available_features = [col for col in FEATURE_COLUMNS if col in model_frame.columns]
+    if not available_features:
+        raise ValueError("No model features available. Run feature engineering first.")
+    if target_column not in model_frame.columns:
+        raise ValueError(f"Missing target column: {target_column}")
+
+    X_train, X_test, y_train, y_test = _split_and_fix_leakage(
+        model_frame, available_features, target_column
+    )
+
+    numeric_columns = [c for c in available_features if model_frame[c].dtype != "object"]
+    categorical_columns = [c for c in available_features if model_frame[c].dtype == "object"]
+    preprocessor = _build_preprocessor(numeric_columns, categorical_columns)
+
+    base_classifier = _build_classifier(model_type)
+    calibrated_classifier = CalibratedClassifierCV(
+        base_classifier, cv=cv, method=method
+    )
+    pipeline = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", calibrated_classifier),
+    ])
+    pipeline.fit(X_train, y_train)
+
+    probabilities = pipeline.predict_proba(X_test)[:, 1]
+    metrics = {
+        "roc_auc": float(roc_auc_score(y_test, probabilities)),
+        "pr_auc": float(average_precision_score(y_test, probabilities)),
+        "log_loss": float(log_loss(y_test, probabilities)),
+        "brier_score": float(brier_score_loss(y_test, probabilities)),
+        "ece": expected_calibration_error(y_test.values, probabilities),
+    }
+
+    return TrainingArtifacts(
+        pipeline=pipeline,
+        metrics=metrics,
+        feature_columns=available_features,
+        model_name=f"{model_type}_calibrated_{method}",
+        X_test=X_test,
+        y_test=y_test,
+        probabilities=probabilities,
+    )

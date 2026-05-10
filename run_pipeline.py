@@ -36,11 +36,14 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from src.features import build_model_frame
+from src.features import build_model_frame, add_shot_decision_quality
 from src.model import (
     train_model,
+    train_calibrated_model,
     cross_validate_model,
     tune_model,
+    run_ablation_study,
+    bootstrap_metric_ci,
     add_expected_points,
     get_feature_importance,
     get_permutation_importance,
@@ -434,7 +437,52 @@ print(f"\n  Model artifact saved → {model_path}")
 
 # Attach xpts predictions to the full dataset
 shots = add_expected_points(shots, xgb_artifacts.pipeline, xgb_artifacts.feature_columns)
+
+# Compute shot decision quality (xPTS relative to zone average)
+shots = add_shot_decision_quality(shots)
+
 shots.to_csv(processed_path, index=False)
+
+# ---------------------------------------------------------------------------
+# 5b. Ablation study – quantify incremental value of each feature tier
+# ---------------------------------------------------------------------------
+print("\nStep 5b – Ablation study (3 feature tiers, XGBoost) …")
+ablation_df = run_ablation_study(shots, model_type="xgboost")
+if not ablation_df.empty:
+    ablation_df.to_csv(OUTPUTS / "ablation_study.csv", index=False)
+    print("\n  Ablation Results (XGBoost, same 80/20 split):")
+    for _, row in ablation_df.iterrows():
+        delta_str = (
+            f"  Δ AUC = {row['delta_roc_auc']:+.4f}"
+            if not np.isnan(row["delta_roc_auc"]) else ""
+        )
+        print(
+            f"    {row['tier']:<28s}  "
+            f"ROC-AUC={row['roc_auc']:.4f}  "
+            f"LogLoss={row['log_loss']:.4f}{delta_str}"
+        )
+
+# ---------------------------------------------------------------------------
+# 5c. Bootstrap confidence intervals (XGBoost test-set, 500 resamples)
+# ---------------------------------------------------------------------------
+print("\nStep 5c – Bootstrap confidence intervals (n=500) …")
+boot_cis = bootstrap_metric_ci(
+    xgb_artifacts.y_test.values,
+    xgb_artifacts.probabilities,
+    n_bootstrap=500,
+)
+print("  XGBoost test-set metrics with 95% bootstrap CI:")
+for metric, (mean_val, lo, hi) in boot_cis.items():
+    print(f"    {metric:>14s}: {mean_val:.4f}  [{lo:.4f}, {hi:.4f}]")
+
+# ---------------------------------------------------------------------------
+# 5d. Calibrated XGBoost (isotonic post-hoc calibration)
+# ---------------------------------------------------------------------------
+print("\nStep 5d – Training calibrated XGBoost (isotonic, 5-fold) …")
+calib_artifacts = train_calibrated_model(shots, model_type="xgboost", method="isotonic")
+print("\n  Calibrated XGBoost metrics (hold-out):")
+for k, v in calib_artifacts.metrics.items():
+    print(f"    {k:>14s}: {v:.4f}")
 
 # ---------------------------------------------------------------------------
 # 6. Charts
@@ -752,14 +800,178 @@ metrics_df = pd.DataFrame([
         "Model": "Logistic Regression",
         **{k: round(v, 4) for k, v in lr_artifacts.metrics.items()},
     },
+    {
+        "Model": "XGBoost (Calibrated)",
+        **{k: round(v, 4) for k, v in calib_artifacts.metrics.items()},
+    },
 ])
 metrics_df.to_csv(OUTPUTS / "model_metrics.csv", index=False)
 print("\n  Model Metrics (hold-out test set):")
 print(metrics_df.to_string(index=False))
 
-player_summary.to_csv(OUTPUTS / "player_summary.csv", index=False)
-print("\n  Player Summary:")
-print(player_summary.to_string(index=False))
+# Update player summary with performance delta vs expected make rate
+if "shot_value" in shots.columns:
+    player_summary2 = (
+        shots.groupby("player_name")
+        .agg(
+            shots_taken=("xpts", "count"),
+            avg_xpts=("xpts", "mean"),
+            make_rate=("shot_made_flag", "mean"),
+            avg_distance=("shot_distance", "mean"),
+            avg_shot_value=("shot_value", "mean"),
+            avg_decision_quality=("decision_quality", "mean") if "decision_quality" in shots.columns else ("xpts", "mean"),
+        )
+        .sort_values("avg_xpts", ascending=False)
+        .reset_index()
+    )
+    player_summary2["xpts_vs_average"] = (
+        player_summary2["avg_xpts"] - player_summary2["avg_xpts"].mean()
+    )
+    # expected_make_rate ≈ avg_xpts / avg_shot_value
+    player_summary2["expected_make_rate"] = (
+        player_summary2["avg_xpts"] / player_summary2["avg_shot_value"].replace(0, 2.0)
+    )
+    player_summary2["performance_delta"] = (
+        player_summary2["make_rate"] - player_summary2["expected_make_rate"]
+    )
+    player_summary2.to_csv(OUTPUTS / "player_summary.csv", index=False)
+    print("\n  Player Summary (with performance delta):")
+    print(player_summary2.head(10).to_string(index=False))
+else:
+    player_summary.to_csv(OUTPUTS / "player_summary.csv", index=False)
+    print("\n  Player Summary:")
+    print(player_summary.to_string(index=False))
+
+
+# ── 6k. Ablation study chart ───────────────────────────────────────────────
+if not ablation_df.empty:
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    tier_labels = ablation_df["tier"].tolist()
+    colors = ["#3498db", "#2ecc71", "#e74c3c"][:len(tier_labels)]
+
+    # ROC-AUC by tier
+    bars = axes[0].barh(tier_labels, ablation_df["roc_auc"], color=colors)
+    for bar, val in zip(bars, ablation_df["roc_auc"]):
+        axes[0].text(val + 0.001, bar.get_y() + bar.get_height() / 2,
+                     f"{val:.4f}", va="center", fontsize=10)
+    axes[0].set_xlim(0, ablation_df["roc_auc"].max() * 1.12)
+    axes[0].set_xlabel("ROC-AUC")
+    axes[0].set_title("ROC-AUC by Feature Tier")
+    axes[0].invert_yaxis()
+
+    # Log-Loss by tier (lower = better)
+    bars2 = axes[1].barh(tier_labels, ablation_df["log_loss"], color=colors)
+    for bar, val in zip(bars2, ablation_df["log_loss"]):
+        axes[1].text(val + 0.001, bar.get_y() + bar.get_height() / 2,
+                     f"{val:.4f}", va="center", fontsize=10)
+    axes[1].set_xlim(0, ablation_df["log_loss"].max() * 1.12)
+    axes[1].set_xlabel("Log-Loss (lower = better)")
+    axes[1].set_title("Log-Loss by Feature Tier")
+    axes[1].invert_yaxis()
+
+    _abl_title = "Ablation Study – Incremental Value of Feature Groups (XGBoost)"
+    if not using_real_data:
+        _abl_title += " (SYNTHETIC DATA)"
+    plt.suptitle(_abl_title, fontsize=13, y=1.02)
+    plt.tight_layout()
+    plt.savefig(OUTPUTS / "ablation_study.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved: outputs/ablation_study.png")
+
+
+# ── 6l. Bootstrap confidence interval chart (XGBoost) ─────────────────────
+if boot_cis:
+    ci_metrics = ["roc_auc", "pr_auc", "log_loss", "brier_score"]
+    labels_ci = ["ROC-AUC", "PR-AUC", "Log-Loss", "Brier Score"]
+
+    means = [boot_cis[m][0] for m in ci_metrics]
+    lows  = [boot_cis[m][1] for m in ci_metrics]
+    highs = [boot_cis[m][2] for m in ci_metrics]
+    xerr_lo = [means[i] - lows[i]  for i in range(len(means))]
+    xerr_hi = [highs[i] - means[i] for i in range(len(means))]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.barh(
+        labels_ci, means,
+        xerr=[xerr_lo, xerr_hi],
+        color=["#3498db"] * len(ci_metrics),
+        capsize=6,
+        error_kw={"lw": 2},
+    )
+    for i, (m, lo, hi) in enumerate(zip(means, lows, highs)):
+        ax.text(hi + 0.003, i, f"{m:.4f}  [{lo:.4f}, {hi:.4f}]",
+                va="center", fontsize=9)
+    ax.set_xlim(0, max(highs) * 1.30)
+    _ci_title = "XGBoost – 95% Bootstrap Confidence Intervals (n=500, test set)"
+    if not using_real_data:
+        _ci_title += " (SYNTHETIC DATA)"
+    ax.set_title(_ci_title)
+    ax.set_xlabel("Metric Value")
+    ax.invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(OUTPUTS / "bootstrap_ci.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved: outputs/bootstrap_ci.png")
+
+
+# ── 6m. Shot archetype spatial chart ──────────────────────────────────────
+if "shot_archetype" in shots.columns and {"loc_x", "loc_y"}.issubset(shots.columns):
+    fig, ax = plt.subplots(figsize=(10, 9))
+    ax.set_facecolor("#1a1a2e")
+    fig.patch.set_facecolor("#1a1a2e")
+    draw_half_court(ax, color="#555577")
+
+    archetypes = sorted(shots["shot_archetype"].unique())
+    palette_arch = sns.color_palette("Set2", len(archetypes))
+    arch_color = dict(zip(archetypes, palette_arch))
+
+    sample_arch = shots.sample(min(4000, len(shots)), random_state=7)
+    for arch in archetypes:
+        sub = sample_arch[sample_arch["shot_archetype"] == arch]
+        ax.scatter(
+            sub["loc_x"], sub["loc_y"],
+            c=[arch_color[arch]], s=12, alpha=0.65, label=arch, linewidths=0,
+        )
+    ax.legend(loc="upper right", framealpha=0.5, fontsize=9)
+    ax.set_xlim(-260, 260)
+    ax.set_ylim(-60, 500)
+    ax.set_aspect("equal")
+    _arch_title = "Shot Archetype Clusters (K-Means, 6 Zones)"
+    if not using_real_data:
+        _arch_title += " (SYNTHETIC DATA)"
+    ax.set_title(_arch_title, color="white", fontsize=14, pad=12)
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#555577")
+    plt.tight_layout()
+    plt.savefig(OUTPUTS / "shot_archetypes.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved: outputs/shot_archetypes.png")
+
+
+# ── 6n. Calibrated vs uncalibrated calibration comparison ─────────────────
+cal_calib = get_calibration_data(calib_artifacts, n_bins=10)
+fig, ax = plt.subplots(figsize=(7, 6))
+ax.plot([0, 1], [0, 1], "k--", lw=1.2, label="Perfect calibration")
+ax.plot(cal_xgb["mean_predicted"], cal_xgb["fraction_positive"],
+        "o-", lw=2, label=f"XGBoost raw (ECE={xgb_artifacts.metrics['ece']:.4f})")
+ax.plot(cal_calib["mean_predicted"], cal_calib["fraction_positive"],
+        "s-", lw=2, label=f"XGBoost + isotonic (ECE={calib_artifacts.metrics['ece']:.4f})")
+ax.plot(cal_lr["mean_predicted"], cal_lr["fraction_positive"],
+        "^-", lw=2, label=f"Logistic (ECE={lr_artifacts.metrics['ece']:.4f})")
+ax.set_xlabel("Mean Predicted Probability")
+ax.set_ylabel("Fraction of Positives (Actual Make Rate)")
+_calib2_title = "Calibration Curves – Effect of Isotonic Post-Hoc Calibration"
+if not using_real_data:
+    _calib2_title += " (SYNTHETIC DATA)"
+ax.set_title(_calib2_title)
+ax.legend(fontsize=9)
+plt.tight_layout()
+plt.savefig(OUTPUTS / "calibration_comparison.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("  Saved: outputs/calibration_comparison.png")
+
 
 print("\n" + "=" * 60)
 print("Pipeline complete. All outputs written to outputs/")
