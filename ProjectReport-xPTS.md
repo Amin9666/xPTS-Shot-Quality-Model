@@ -58,14 +58,14 @@ Interpretation: player-zone shooting history dominates, with spatial geometry an
 ## 5. Graphs
 
 ### Model comparison visuals
-![ROC curves comparing XGBoost and Logistic Regression](outputs/roc_curves.png)
-![Precision-recall curves comparing XGBoost and Logistic Regression](outputs/pr_curves.png)
-![Calibration curves comparing XGBoost and Logistic Regression](outputs/calibration_curves.png)
-![Learning curves for XGBoost across training sizes](outputs/learning_curves.png)
+![ROC curves showing XGBoost slightly above Logistic Regression on overall discrimination](outputs/roc_curves.png)
+![Precision-recall curves showing higher PR-AUC for XGBoost than Logistic Regression](outputs/pr_curves.png)
+![Calibration curves showing Logistic Regression closer to perfect calibration than XGBoost](outputs/calibration_curves.png)
+![Learning curves showing XGBoost train/validation performance as training size increases](outputs/learning_curves.png)
 
 ### Feature/parameter importance visuals
 ![Built-in XGBoost feature importance ranking](outputs/feature_importance.png)
-![Permutation importance showing mean ROC-AUC drop by feature](outputs/permutation_importance.png)
+![Permutation importance chart showing player_zone_fg_pct as the dominant feature by ROC-AUC drop](outputs/permutation_importance.png)
 
 ### Shot quality and outcome visuals
 ![NBA shot chart colored by predicted xPTS](outputs/shot_chart_xpts.png)

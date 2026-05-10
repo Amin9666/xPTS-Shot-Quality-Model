@@ -127,6 +127,7 @@ def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_bool_dtype(df["shot_made_flag"]):
             df["shot_made_flag"] = df["shot_made_flag"].astype(int)
         else:
+            _raw_shot_made = df["shot_made_flag"]
             _mapped = (
                 df["shot_made_flag"]
                 .astype(str)
@@ -142,7 +143,33 @@ def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
                 })
             )
             if _mapped.notna().any():
+                if "shot_result" in df.columns:
+                    _from_result = (
+                        df["shot_result"]
+                        .astype(str)
+                        .str.strip()
+                        .str.lower()
+                        .map({"made shot": 1, "missed shot": 0})
+                    )
+                    _mapped = _mapped.fillna(_from_result)
+                unknown_count = int(_mapped.isna().sum())
+                if unknown_count > 0:
+                    print(
+                        f"  WARNING: {unknown_count} shot_made_flag values were unmapped; "
+                        "defaulting them to 0.",
+                        file=sys.stderr,
+                    )
                 df["shot_made_flag"] = _mapped.fillna(0).astype(int)
+            else:
+                _numeric = pd.to_numeric(_raw_shot_made, errors="coerce")
+                unknown_count = int(_numeric.isna().sum())
+                if unknown_count > 0:
+                    print(
+                        f"  WARNING: {unknown_count} shot_made_flag values could not be parsed; "
+                        "defaulting them to 0.",
+                        file=sys.stderr,
+                    )
+                df["shot_made_flag"] = _numeric.fillna(0).astype(int)
 
     # Derive shot_angle
     if "shot_angle" not in df.columns:
@@ -151,9 +178,9 @@ def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
 
     # Placeholder columns not present in the league CSV
     for col, default in [
-        ("period", 1),
-        ("minutes_remaining", 0),
-        ("seconds_remaining", 0),
+        ("period", np.nan),
+        ("minutes_remaining", np.nan),
+        ("seconds_remaining", np.nan),
         ("score_diff", 0),
         ("shot_clock", 12.0),
         ("home_score", 0),
