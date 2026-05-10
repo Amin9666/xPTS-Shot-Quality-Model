@@ -700,7 +700,7 @@ def run_ablation_study(
         X_full_all, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
-    prev_auc: float | None = None
+    prev_tier_auc: float | None = None
     for tier_name, tier_features in FEATURE_TIERS.items():
         available = [f for f in tier_features if f in model_frame.columns]
         if not available:
@@ -739,10 +739,10 @@ def run_ablation_study(
                 "log_loss": float(log_loss(y_test, probs)),
                 "brier_score": float(brier_score_loss(y_test, probs)),
                 "ece": expected_calibration_error(y_test.values, probs),
-                "delta_roc_auc": (auc - prev_auc) if prev_auc is not None else float("nan"),
+                "delta_roc_auc": (auc - prev_tier_auc) if prev_tier_auc is not None else float("nan"),
             }
             rows.append(row)
-            prev_auc = auc
+            prev_tier_auc = auc
 
         except Exception as exc:
             print(

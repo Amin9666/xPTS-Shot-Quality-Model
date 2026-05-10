@@ -811,16 +811,19 @@ print(metrics_df.to_string(index=False))
 
 # Update player summary with performance delta vs expected make rate
 if "shot_value" in shots.columns:
+    _has_dq = "decision_quality" in shots.columns
+    _agg_spec: dict = {
+        "shots_taken": ("xpts", "count"),
+        "avg_xpts": ("xpts", "mean"),
+        "make_rate": ("shot_made_flag", "mean"),
+        "avg_distance": ("shot_distance", "mean"),
+        "avg_shot_value": ("shot_value", "mean"),
+    }
+    if _has_dq:
+        _agg_spec["avg_decision_quality"] = ("decision_quality", "mean")
     player_summary2 = (
         shots.groupby("player_name")
-        .agg(
-            shots_taken=("xpts", "count"),
-            avg_xpts=("xpts", "mean"),
-            make_rate=("shot_made_flag", "mean"),
-            avg_distance=("shot_distance", "mean"),
-            avg_shot_value=("shot_value", "mean"),
-            avg_decision_quality=("decision_quality", "mean") if "decision_quality" in shots.columns else ("xpts", "mean"),
-        )
+        .agg(**_agg_spec)
         .sort_values("avg_xpts", ascending=False)
         .reset_index()
     )

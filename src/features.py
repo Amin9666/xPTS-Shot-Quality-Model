@@ -86,8 +86,8 @@ def _name_court_region(cx: float, cy: float) -> str:
     −52 (behind backboard) upward toward half-court (~470).  All thresholds
     below are expressed in the same tenths-of-a-foot units.
     """
-    dist = float(np.sqrt(cx ** 2 + cy ** 2))
-    abs_cx = float(abs(cx))
+    dist = np.sqrt(cx ** 2 + cy ** 2)
+    abs_cx = abs(cx)
     if dist < 60:
         return "Rim"
     if dist < 130:

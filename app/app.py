@@ -213,10 +213,10 @@ def _tab_player_analysis(filtered: pd.DataFrame) -> None:
         # Reference line: perfect calibration (actual = expected)
         min_xpts = float(player_tbl["Avg_xPTS"].min())
         max_xpts = float(player_tbl["Avg_xPTS"].max())
-        avg_sv = float(filtered["shot_value"].mean()) if "shot_value" in filtered.columns else 2.0
+        avg_shot_value = float(filtered["shot_value"].mean()) if "shot_value" in filtered.columns else 2.0
         fig_res.add_trace(go.Scatter(
             x=[min_xpts, max_xpts],
-            y=[min_xpts / avg_sv, max_xpts / avg_sv],
+            y=[min_xpts / avg_shot_value, max_xpts / avg_shot_value],
             mode="lines",
             line=dict(color="white", dash="dash", width=1.5),
             name="Expected (model-calibrated)",
@@ -340,7 +340,7 @@ def _tab_whatif(model_artifact: dict | None, df: pd.DataFrame) -> None:
     with col_r:
         score_diff_abs = st.slider("Score Differential |Δ|", 0, 40, 5, key="wi_sd")
         shot_clock = st.slider("Shot Clock (sec)", 0, 24, 12, key="wi_sc")
-        league_avg_fg = 0.467  # approximate NBA league average
+        league_avg_fg = 0.467  # approximate 2024-25 NBA FG% (source: nba.com/stats)
         if "player_zone_fg_pct" in feature_columns:
             player_zone_fg_pct = st.slider(
                 "Player Zone FG% (use league avg as default)",
