@@ -19,7 +19,7 @@ The goal is to estimate expected scoring value per shot using spatial context, c
 
 The modeling dataset contains **1,208** shot attempts with an overall make rate of **42.30%** and average shot value of **2.742 points**.
 
-Key zone-level findings:
+Key zone-level findings (xPTS values are **model-predicted** expected points, not simply empirical make-rate × point value):
 
 - **Above the Break 3:** 600 shots, make rate 40.00%, avg xPTS 1.209  
 - **Restricted Area:** 145 shots, make rate 61.38%, avg xPTS 1.194  
@@ -74,6 +74,7 @@ Top features by mean ROC-AUC drop:
 ### 4.c Interpretation
 
 - Logistic Regression outperformed XGBoost on all reported hold-out metrics in this run, especially calibration (**ECE 0.0113**).  
+- XGBoost performance is near chance (ROC-AUC ~0.50), so it is not a reliable model for this data snapshot.
 - Court geometry and shot context remain the main predictive drivers.  
 - High-value attempts cluster in expected regions: rim and 3-point areas.
 
