@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 # Allow importing from src/ without an install step
@@ -97,6 +98,18 @@ def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
     # Lowercase all column names (notebook 01 already does this, but be defensive)
     df.columns = df.columns.str.lower()
 
+    # Common schema aliases (including uploaded 2024-25/2025 league exports)
+    alias_map = {
+        "basic_zone": "shot_zone_basic",
+        "quarter": "period",
+        "mins_left": "minutes_remaining",
+        "secs_left": "seconds_remaining",
+        "shot_made": "shot_made_flag",
+    }
+    for src, dst in alias_map.items():
+        if src in df.columns and dst not in df.columns:
+            df = df.rename(columns={src: dst})
+
     # event_type → shot_result
     if "event_type" in df.columns and "shot_result" not in df.columns:
         df = df.rename(columns={"event_type": "shot_result"})
@@ -109,6 +122,28 @@ def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
     if "shot_value" not in df.columns:
         df["shot_value"] = df["shot_type"].apply(lambda t: 3 if "3PT" in str(t) else 2)
 
+    # Normalise shot_made_flag to 0/1
+    if "shot_made_flag" in df.columns:
+        if pd.api.types.is_bool_dtype(df["shot_made_flag"]):
+            df["shot_made_flag"] = df["shot_made_flag"].astype(int)
+        else:
+            _mapped = (
+                df["shot_made_flag"]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .map({
+                    "true": 1,
+                    "false": 0,
+                    "1": 1,
+                    "0": 0,
+                    "made shot": 1,
+                    "missed shot": 0,
+                })
+            )
+            if _mapped.notna().any():
+                df["shot_made_flag"] = _mapped.fillna(0).astype(int)
+
     # Derive shot_angle
     if "shot_angle" not in df.columns:
         safe_x = df["loc_x"].replace(0, _EPSILON)
@@ -116,6 +151,9 @@ def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
 
     # Placeholder columns not present in the league CSV
     for col, default in [
+        ("period", 1),
+        ("minutes_remaining", 0),
+        ("seconds_remaining", 0),
         ("score_diff", 0),
         ("shot_clock", 12.0),
         ("home_score", 0),
@@ -170,15 +208,32 @@ def _fetch_full_league(season: str = "2023-24") -> pd.DataFrame:
     return result
 
 
+def _load_uploaded_zip_csv(zip_path: Path) -> tuple[pd.DataFrame, str]:
+    """Load the first CSV from a user-uploaded zip archive."""
+    with zipfile.ZipFile(zip_path) as archive:
+        csv_members = [
+            name for name in archive.namelist()
+            if name.lower().endswith(".csv") and not name.lower().startswith("__macosx/")
+        ]
+        if not csv_members:
+            raise ValueError(f"No CSV file found inside {zip_path}")
+        member = csv_members[0]
+        with archive.open(member) as fh:
+            df = pd.read_csv(fh)
+    return df, member
+
+
 using_real_data = True
 shots_raw: pd.DataFrame
+uploaded_zip_path = Path("NBA_2025_Shots.csv.zip")
+real_chart_title = "NBA League Shot Chart – Coloured by xPTS"
 
 # ── Priority 1: existing data/raw/shots.csv ──────────────────────────────────
 if raw_path.exists():
     _candidate = pd.read_csv(raw_path)
     if _looks_like_real_data(_candidate):
         shots_raw = _normalise_league_csv(_candidate)
-        chart_title = "NBA 2023-24 League Shot Chart – Coloured by xPTS"
+        chart_title = real_chart_title
         print(
             f"  ✓ Data source: REAL NBA data (data/raw/shots.csv) — "
             f"{len(shots_raw):,} shots loaded"
@@ -186,22 +241,84 @@ if raw_path.exists():
     else:
         print(
             f"  data/raw/shots.csv exists but looks synthetic ({len(_candidate):,} rows). "
-            "Trying nba_api …"
+            "Trying uploaded zip or nba_api …"
         )
-
+        loaded_uploaded_zip = False
+        if uploaded_zip_path.exists():
+            try:
+                uploaded_df, uploaded_member = _load_uploaded_zip_csv(uploaded_zip_path)
+                shots_raw = _normalise_league_csv(uploaded_df)
+                shots_raw.to_csv(raw_path, index=False)
+                chart_title = real_chart_title
+                loaded_uploaded_zip = True
+                print(
+                    f"  ✓ Data source: REAL NBA data ({uploaded_zip_path}/{uploaded_member}) — "
+                    f"{len(shots_raw):,} shots loaded and saved → {raw_path}"
+                )
+            except Exception as exc:
+                print(
+                    f"  WARNING: could not load {uploaded_zip_path} "
+                    f"({type(exc).__name__}: {exc}).",
+                    file=sys.stderr,
+                )
+        if not loaded_uploaded_zip:
+            # ── Priority 2: fetch full league via nba_api ─────────────────────
+            try:
+                _raise_if_ci()
+                print("  Fetching full 2023-24 league shot data via nba_api (all 30 teams) …")
+                shots_raw = _fetch_full_league(season="2023-24")
+                shots_raw = _normalise_league_csv(shots_raw)
+                shots_raw.to_csv(raw_path, index=False)
+                chart_title = real_chart_title
+                print(
+                    f"  ✓ Data source: REAL NBA data (nba_api, all teams) — "
+                    f"{len(shots_raw):,} shots fetched and saved → {raw_path}"
+                )
+            except Exception as exc:
+                print(
+                    f"  WARNING: nba_api fetch failed ({type(exc).__name__}: {exc}). "
+                    "Falling back to synthetic data.",
+                    file=sys.stderr,
+                )
+                from src.generate_synthetic_data import generate_curry_shots
+                shots_raw = generate_curry_shots()
+                chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
+                using_real_data = False
+                print(f"  ✓ Data source: SYNTHETIC Curry data — {len(shots_raw):,} shots generated")
+else:
+    loaded_uploaded_zip = False
+    if uploaded_zip_path.exists():
+        try:
+            uploaded_df, uploaded_member = _load_uploaded_zip_csv(uploaded_zip_path)
+            shots_raw = _normalise_league_csv(uploaded_df)
+            shots_raw.to_csv(raw_path, index=False)
+            chart_title = real_chart_title
+            loaded_uploaded_zip = True
+            print(
+                f"  ✓ Data source: REAL NBA data ({uploaded_zip_path}/{uploaded_member}) — "
+                f"{len(shots_raw):,} shots loaded and saved → {raw_path}"
+            )
+        except Exception as exc:
+            print(
+                f"  WARNING: could not load {uploaded_zip_path} "
+                f"({type(exc).__name__}: {exc}).",
+                file=sys.stderr,
+            )
+    if not loaded_uploaded_zip:
         # ── Priority 2: fetch full league via nba_api ─────────────────────────
         try:
             _raise_if_ci()
-            print("  Fetching full 2023-24 league shot data via nba_api (all 30 teams) …")
+            print("  data/raw/shots.csv not found. Fetching full 2023-24 league data via nba_api …")
             shots_raw = _fetch_full_league(season="2023-24")
             shots_raw = _normalise_league_csv(shots_raw)
             shots_raw.to_csv(raw_path, index=False)
-            chart_title = "NBA 2023-24 League Shot Chart – Coloured by xPTS"
+            chart_title = real_chart_title
             print(
                 f"  ✓ Data source: REAL NBA data (nba_api, all teams) — "
                 f"{len(shots_raw):,} shots fetched and saved → {raw_path}"
             )
         except Exception as exc:
+            # ── Priority 3: synthetic fallback ────────────────────────────────
             print(
                 f"  WARNING: nba_api fetch failed ({type(exc).__name__}: {exc}). "
                 "Falling back to synthetic data.",
@@ -212,31 +329,6 @@ if raw_path.exists():
             chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
             using_real_data = False
             print(f"  ✓ Data source: SYNTHETIC Curry data — {len(shots_raw):,} shots generated")
-else:
-    # ── Priority 2: fetch full league via nba_api ─────────────────────────────
-    try:
-        _raise_if_ci()
-        print("  data/raw/shots.csv not found. Fetching full 2023-24 league data via nba_api …")
-        shots_raw = _fetch_full_league(season="2023-24")
-        shots_raw = _normalise_league_csv(shots_raw)
-        shots_raw.to_csv(raw_path, index=False)
-        chart_title = "NBA 2023-24 League Shot Chart – Coloured by xPTS"
-        print(
-            f"  ✓ Data source: REAL NBA data (nba_api, all teams) — "
-            f"{len(shots_raw):,} shots fetched and saved → {raw_path}"
-        )
-    except Exception as exc:
-        # ── Priority 3: synthetic fallback ────────────────────────────────────
-        print(
-            f"  WARNING: nba_api fetch failed ({type(exc).__name__}: {exc}). "
-            "Falling back to synthetic data.",
-            file=sys.stderr,
-        )
-        from src.generate_synthetic_data import generate_curry_shots
-        shots_raw = generate_curry_shots()
-        chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
-        using_real_data = False
-        print(f"  ✓ Data source: SYNTHETIC Curry data — {len(shots_raw):,} shots generated")
 
 shots_raw.to_csv(raw_path, index=False)
 print(f"  {len(shots_raw):,} shots saved → {raw_path}")
