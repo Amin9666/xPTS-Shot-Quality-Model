@@ -4,8 +4,9 @@ run_pipeline.py – End-to-end xPTS Shot Quality Model pipeline.
 Data priority:
   1. Load data/raw/shots.csv if it exists and looks like real NBA data
      (row count > 5,000 or contains game_id / player_id columns).
-  2. Fetch real NBA data via nba_api for all 30 teams (2023-24 season).
-  3. Fall back to synthetic Curry data (all chart titles marked SYNTHETIC DATA).
+  2. Load NBA_2025_Shots.csv.zip when available (user-uploaded real data).
+  3. Fetch real NBA data via nba_api for all 30 teams (2023-24 season).
+  4. Fall back to synthetic Curry data (all chart titles marked SYNTHETIC DATA).
 
 Engineers features, trains XGBoost + Logistic Regression models, evaluates them
 with rigorous ML metrics (ROC-AUC, PR-AUC, log-loss, Brier score, ECE), runs
@@ -253,14 +254,14 @@ def _load_uploaded_zip_csv(zip_path: Path) -> tuple[pd.DataFrame, str]:
 using_real_data = True
 shots_raw: pd.DataFrame
 uploaded_zip_path = Path("NBA_2025_Shots.csv.zip")
-real_chart_title = "NBA League Shot Chart – Colored by xPTS"
+nba_league_chart_title = "NBA League Shot Chart – Colored by xPTS"
 
 # ── Priority 1: existing data/raw/shots.csv ──────────────────────────────────
 if raw_path.exists():
     _candidate = pd.read_csv(raw_path)
     if _looks_like_real_data(_candidate):
         shots_raw = _normalise_league_csv(_candidate)
-        chart_title = real_chart_title
+        chart_title = nba_league_chart_title
         print(
             f"  ✓ Data source: REAL NBA data (data/raw/shots.csv) — "
             f"{len(shots_raw):,} shots loaded"
@@ -276,7 +277,7 @@ if raw_path.exists():
                 uploaded_df, uploaded_member = _load_uploaded_zip_csv(uploaded_zip_path)
                 shots_raw = _normalise_league_csv(uploaded_df)
                 shots_raw.to_csv(raw_path, index=False)
-                chart_title = real_chart_title
+                chart_title = nba_league_chart_title
                 loaded_uploaded_zip = True
                 print(
                     f"  ✓ Data source: REAL NBA data ({uploaded_zip_path}/{uploaded_member}) — "
@@ -296,7 +297,7 @@ if raw_path.exists():
                 shots_raw = _fetch_full_league(season="2023-24")
                 shots_raw = _normalise_league_csv(shots_raw)
                 shots_raw.to_csv(raw_path, index=False)
-                chart_title = real_chart_title
+                chart_title = nba_league_chart_title
                 print(
                     f"  ✓ Data source: REAL NBA data (nba_api, all teams) — "
                     f"{len(shots_raw):,} shots fetched and saved → {raw_path}"
@@ -319,7 +320,7 @@ else:
             uploaded_df, uploaded_member = _load_uploaded_zip_csv(uploaded_zip_path)
             shots_raw = _normalise_league_csv(uploaded_df)
             shots_raw.to_csv(raw_path, index=False)
-            chart_title = real_chart_title
+            chart_title = nba_league_chart_title
             loaded_uploaded_zip = True
             print(
                 f"  ✓ Data source: REAL NBA data ({uploaded_zip_path}/{uploaded_member}) — "
@@ -339,7 +340,7 @@ else:
             shots_raw = _fetch_full_league(season="2023-24")
             shots_raw = _normalise_league_csv(shots_raw)
             shots_raw.to_csv(raw_path, index=False)
-            chart_title = real_chart_title
+            chart_title = nba_league_chart_title
             print(
                 f"  ✓ Data source: REAL NBA data (nba_api, all teams) — "
                 f"{len(shots_raw):,} shots fetched and saved → {raw_path}"
