@@ -1,109 +1,85 @@
-# xPTS Shot Quality Model Report
+# xPTS Shot Quality Model Report (Real 2025 NBA Data)
 
 **Author:** Amin9666  
 **Project:** Expected Points (xPTS) for NBA shot quality  
-**Data snapshot used in this report:** `data/processed/shots_model_input.csv` (1,208 shot attempts)
+**Data snapshot used in this report:** `NBA_2025_Shots.csv.zip` → `data/processed/shots_model_input.csv` (**219,527** shots)
 
-## 1. Introduction
+## 1. Overview
 
-Traditional field goal percentage is noisy at the possession level and does not fully capture shot quality.  
-This project models shot quality with **xPTS**, defined as:
+This rebuild uses the uploaded full-league 2025 shot data and compares **XGBoost** vs **Logistic Regression** on shot make prediction, then converts make probabilities to expected points:
 
 $$
-\text{xPTS} = P(\text{make}) \times \text{shot value (2 or 3)}
+\text{xPTS} = P(\text{make}) \times \text{shot value}
 $$
 
-The goal is to estimate expected scoring value per shot using spatial context, clock pressure, and player-zone tendencies, then evaluate both discrimination and calibration quality.
+## 2. Data Snapshot
 
-## 2. Data Exploration
+- Total shots: **219,527**
+- Overall make rate: **46.72%**
+- Average shot value: **2.421**
+- Average modeled xPTS: **1.057**
 
-The modeling dataset contains **1,208** shot attempts with an overall make rate of **42.30%** and average shot value of **2.742 points**.
+Largest shot zones:
 
-Key zone-level findings (xPTS values are **model-predicted** expected points, not simply empirical make-rate × point value):
-
-- **Above the Break 3:** 600 shots, make rate 40.00%, avg xPTS 1.209  
-- **Restricted Area:** 145 shots, make rate 61.38%, avg xPTS 1.194  
-- **Corner 3s:** lower make rates but still competitive xPTS because of 3-point value  
-- **Backcourt:** lowest-value attempts (avg xPTS 0.601)
+- **Above the Break 3:** 68,358 shots, make rate 35.32%, avg xPTS 0.996
+- **Restricted Area:** 61,190 shots, make rate 66.36%, avg xPTS 1.377
+- **In The Paint (Non-RA):** 44,475 shots, make rate 44.37%, avg xPTS 0.862
 
 Shot type summary:
 
-- **2PT Field Goals:** 312 shots, make rate 52.56%, avg xPTS 1.053  
-- **3PT Field Goals:** 896 shots, make rate 38.73%, avg xPTS 1.143
+- **2PT Field Goal:** 127,073 shots, make rate 54.51%, avg xPTS 1.097
+- **3PT Field Goal:** 92,454 shots, make rate 36.02%, avg xPTS 1.000
 
-Overall average xPTS in this sample is **1.119**.
-
-## 3. Data Preparation
-
-The pipeline performs:
-
-1. Feature engineering (distance transforms, shot angle interactions, game context, late-clock flags).
-2. Leakage-safe handling of `player_zone_fg_pct` by recomputing zone encodings within each train split/fold.
-3. Stratified train/test splitting for hold-out evaluation.
-4. 5-fold cross-validation for robustness checks.
-
-This workflow is designed to avoid target leakage and to produce realistic out-of-sample metrics.
-
-## 4. Models and Results
-
-Two models were evaluated on the hold-out test set:
+## 3. XGBoost vs Linear Regression (Hold-out Test)
 
 | Model | ROC-AUC | PR-AUC | Log-Loss | Brier | ECE |
 |---|---:|---:|---:|---:|---:|
-| XGBoost | 0.5026 | 0.4443 | 0.8018 | 0.2892 | 0.2046 |
-| Logistic Regression | 0.5777 | 0.4917 | 0.6728 | 0.2401 | 0.0113 |
+| XGBoost | 0.6434 | 0.6384 | 0.6513 | 0.2300 | 0.0262 |
+| Logistic Regression | 0.6394 | 0.6168 | 0.6557 | 0.2318 | 0.0160 |
 
-### 4.a Cross-Validation (XGBoost, 5-fold)
+Key differences:
 
-- ROC-AUC: **0.4997 ± 0.0450**
-- PR-AUC: **0.4691 ± 0.0405**
-- Log-Loss: **0.7892 ± 0.0438**
-- Brier: **0.2834 ± 0.0185**
-- ECE: **0.1730 ± 0.0363**
+- **XGBoost wins discrimination/error metrics** (ROC-AUC, PR-AUC, Log-Loss, Brier).
+- **Logistic Regression is better calibrated** (lower ECE).
+- Both models are materially stronger on this real dataset than earlier synthetic runs.
 
-### 4.b Feature Importance (Permutation, XGBoost)
+## 4. Parameter Importance
 
-Top features by mean ROC-AUC drop:
+Top permutation importances (XGBoost, mean ROC-AUC drop):
 
-1. `shot_angle` (0.0310)
-2. `distance_sq` (0.0088)
-3. `shot_clock` (0.0060)
-4. `player_zone_fg_pct` (0.0052)
-5. `dist_angle_ix` (0.0016)
+1. `player_zone_fg_pct` (0.1057)
+2. `shot_angle` (0.0063)
+3. `shot_distance` (0.0035)
+4. `dist_angle_ix` (0.0023)
+5. `game_seconds_remaining` (0.0022)
 
-### 4.c Interpretation
+Interpretation: player-zone shooting history dominates, with spatial geometry and game context as secondary drivers.
 
-- Logistic Regression outperformed XGBoost on all reported hold-out metrics in this run, especially calibration (**ECE 0.0113**).  
-- XGBoost performance is near chance (ROC-AUC ~0.50), so it is not a reliable model for this data snapshot.
-- Court geometry and shot context remain the main predictive drivers.  
-- High-value attempts cluster in expected regions: rim and 3-point areas.
+## 5. Graphs
 
-## 5. Visual Outputs (Generated)
+### Model comparison visuals
+![ROC curves showing XGBoost slightly above Logistic Regression on overall discrimination](outputs/roc_curves.png)
+![Precision-recall curves showing higher PR-AUC for XGBoost than Logistic Regression](outputs/pr_curves.png)
+![Calibration curves showing Logistic Regression closer to perfect calibration than XGBoost](outputs/calibration_curves.png)
+![Learning curves showing XGBoost train/validation performance as training size increases](outputs/learning_curves.png)
 
-The following charts support this report:
+### Feature/parameter importance visuals
+![Built-in XGBoost feature importance ranking](outputs/feature_importance.png)
+![Permutation importance chart showing player_zone_fg_pct as the dominant feature by ROC-AUC drop](outputs/permutation_importance.png)
 
-- Shot chart: `outputs/shot_chart_xpts.png`
-- ROC curves: `outputs/roc_curves.png`
-- PR curves: `outputs/pr_curves.png`
-- Calibration curves: `outputs/calibration_curves.png`
-- Learning curves: `outputs/learning_curves.png`
-- Permutation importance: `outputs/permutation_importance.png`
-- Player summary: `outputs/player_summary.png`
-- xPTS by zone: `outputs/xpts_by_zone.png`
+### Shot quality and outcome visuals
+![NBA shot chart colored by predicted xPTS](outputs/shot_chart_xpts.png)
+![Average xPTS by shot zone](outputs/xpts_by_zone.png)
+![Top and bottom players by average shot quality](outputs/player_summary.png)
 
 ## 6. Conclusion
 
-This xPTS pipeline delivers an end-to-end shot quality evaluation system with leakage-aware modeling and interpretable outputs.  
-In this data snapshot, **Logistic Regression** is the stronger deployment candidate due to substantially better probability calibration, while the model diagnostics confirm that shot geometry and context explain most of the learnable signal.
+Using the uploaded 2025 real NBA dataset, the pipeline now produces a robust league-scale xPTS report. XGBoost delivers slightly better ranking and error performance, while linear/logistic regression remains more reliable for calibration-sensitive use cases.
 
-## A. Bibliography
+## Appendix: Sources
 
-1. NBA API (`nba_api`) documentation and endpoints: https://github.com/swar/nba_api  
-2. Project pipeline and artifacts: `run_pipeline.py`, `src/model.py`, and `outputs/*.csv` in this repository.
-
-## B. Appendix: Source Tables
-
-- Metrics table source: `outputs/model_metrics.csv`
-- Cross-validation source: `outputs/cv_results_xgboost.csv`
-- Permutation source: `outputs/permutation_importance.csv`
-- Player summary source: `outputs/player_summary.csv`
+- Pipeline: `run_pipeline.py`
+- Metrics table: `outputs/model_metrics.csv`
+- XGBoost CV summary: `outputs/cv_results_xgboost.csv`
+- Permutation importance: `outputs/permutation_importance.csv`
+- Player summary: `outputs/player_summary.csv`
