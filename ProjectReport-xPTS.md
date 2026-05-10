@@ -9,9 +9,9 @@
 Traditional field goal percentage is noisy at the possession level and does not fully capture shot quality.  
 This project models shot quality with **xPTS**, defined as:
 
-\[
+$$
 \text{xPTS} = P(\text{make}) \times \text{shot value (2 or 3)}
-\]
+$$
 
 The goal is to estimate expected scoring value per shot using spatial context, clock pressure, and player-zone tendencies, then evaluate both discrimination and calibration quality.
 
