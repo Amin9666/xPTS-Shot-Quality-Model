@@ -172,6 +172,16 @@ def _normalise_league_csv(df: pd.DataFrame) -> pd.DataFrame:
                     )
                 df["shot_made_flag"] = _numeric.fillna(0).astype(int)
 
+    # Normalise court coordinates to tenths-of-a-foot (the NBA tracking standard).
+    # Some CSV exports (e.g. the uploaded 2024-25 league file) store LOC_X/LOC_Y
+    # in plain feet (|loc_x| ≤ 25, loc_y ≤ ~90).  The pipeline and shot-chart
+    # rendering code all expect tenths-of-a-foot (|loc_x| ≤ 250, loc_y ≤ ~900),
+    # so we multiply by 10 when feet are detected.
+    if "loc_x" in df.columns and "loc_y" in df.columns:
+        if df["loc_x"].abs().max() <= 50 and df["loc_y"].max() <= 100:
+            df["loc_x"] = df["loc_x"] * 10
+            df["loc_y"] = df["loc_y"] * 10
+
     # Derive shot_angle
     if "shot_angle" not in df.columns:
         safe_x = df["loc_x"].replace(0, _EPSILON)
