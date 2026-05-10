@@ -226,7 +226,7 @@ def _load_uploaded_zip_csv(zip_path: Path) -> tuple[pd.DataFrame, str]:
 using_real_data = True
 shots_raw: pd.DataFrame
 uploaded_zip_path = Path("NBA_2025_Shots.csv.zip")
-real_chart_title = "NBA League Shot Chart – Coloured by xPTS"
+real_chart_title = "NBA League Shot Chart – Colored by xPTS"
 
 # ── Priority 1: existing data/raw/shots.csv ──────────────────────────────────
 if raw_path.exists():
@@ -282,7 +282,7 @@ if raw_path.exists():
                 )
                 from src.generate_synthetic_data import generate_curry_shots
                 shots_raw = generate_curry_shots()
-                chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
+                chart_title = "Stephen Curry Shot Chart – Colored by xPTS (SYNTHETIC DATA)"
                 using_real_data = False
                 print(f"  ✓ Data source: SYNTHETIC Curry data — {len(shots_raw):,} shots generated")
 else:
@@ -326,7 +326,7 @@ else:
             )
             from src.generate_synthetic_data import generate_curry_shots
             shots_raw = generate_curry_shots()
-            chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
+            chart_title = "Stephen Curry Shot Chart – Colored by xPTS (SYNTHETIC DATA)"
             using_real_data = False
             print(f"  ✓ Data source: SYNTHETIC Curry data — {len(shots_raw):,} shots generated")
 
@@ -431,7 +431,7 @@ if using_real_data:
 else:
     if shots["player_name"].nunique() > 1:
         chart_shots = shots[shots["player_name"] == "Stephen Curry"]
-        chart_title = "Stephen Curry Shot Chart – Coloured by xPTS (SYNTHETIC DATA)"
+        chart_title = "Stephen Curry Shot Chart – Colored by xPTS (SYNTHETIC DATA)"
     else:
         chart_shots = shots
 
